@@ -1,0 +1,3186 @@
+# (c) 2020 Frabit Project maintained and limited by Blylei < blylei.info@gmail.com >
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
+#
+# This file is part of Frabit
+#
+"""
+This module represents a Server.
+Frabit is able to manage multiple servers.
+"""
+import errno
+import json
+import logging
+import os
+import re
+import shutil
+import sys
+import tarfile
+import time
+from collections import namedtuple
+from contextlib import closing, contextmanager
+from glob import glob
+from tempfile import NamedTemporaryFile
+
+import frabit
+from frabit import output
+from frabit.backup import BackupManager
+from frabit.command_wrappers import FrabitSubProcess, Command, Rsync
+from frabit.exceptions import (ArchiverFailure,
+                               CommandFailedException, ConninfoException,
+                               LockFileBusy, LockFileException,
+                               LockFilePermissionDenied,
+                               MysqlException,
+                               MysqlIsInRecovery,
+                               MysqlSuperuserRequired,
+                               MysqlUnsupportedFeature, SyncError,
+                               SyncNothingToDo, SyncToBeDeleted, TimeoutError,
+                               UnknownBackupIdException)
+from frabit.info import BackupInfo, LocalBackupInfo, BinlogInfo
+from frabit.lock import (ServerBackupIdLock, ServerBackupLock,
+                         ServerBackupSyncLock, ServerCronLock,
+                         ServerWalArchiveLock, ServerBinlogSyncLock
+                         )
+from frabit.mysql import MySQLConnection
+from frabit.process import ProcessManager
+from frabit.remote_status import RemoteStatusMixin
+from frabit.retention_policies import RetentionPolicyFactory
+from frabit.utils import (FrabitEncoder, file_md5, force_str, fsync_dir,
+                          fsync_file, human_readable_timedelta,
+                          is_power_of_two, pretty_size, timeout)
+
+PARTIAL_EXTENSION = '.partial'
+PRIMARY_INFO_FILE = 'primary.info'
+SYNC_WALS_INFO_FILE = 'sync-wals.info'
+
+_logger = logging.getLogger(__name__)
+
+
+class CheckStrategy(object):
+    """
+    This strategy for the 'check' collects the results of
+    every check and does not print any message.
+    This basic class is also responsible for immediately
+    logging any performed check with an error in case of
+    check failure and a debug message in case of success.
+    """
+
+    # create a namedtuple object called CheckResult to manage check results
+    CheckResult = namedtuple('CheckResult', 'server_name check status')
+
+    # Default list used as a filter to identify non-critical checks
+    NON_CRITICAL_CHECKS = ['minimum redundancy requirements',
+                           'backup maximum age',
+                           'failed backups',
+                           'archiver errors',
+                           'empty incoming directory',
+                           'empty streaming directory',
+                           'incoming WALs directory',
+                           'streaming WALs directory',
+                           ]
+
+    def __init__(self, ignore_checks=NON_CRITICAL_CHECKS):
+        """
+        Silent Strategy constructor
+
+        :param list ignore_checks: list of checks that can be ignored
+        """
+        self.ignore_list = ignore_checks
+        self.check_result = []
+        self.has_error = False
+        self.running_check = None
+
+    def init_check(self, check_name):
+        """
+        Mark in the debug log when frabit starts the execution of a check
+
+        :param str check_name: the name of the check that is starting
+        """
+        self.running_check = check_name
+        _logger.debug("Starting check: '{}'".format(check_name))
+
+    def _check_name(self, check):
+        if not check:
+            check = self.running_check
+        assert check
+        return check
+
+    def result(self, server_name, status, hint=None, check=None):
+        """
+        Store the result of a check (with no output).
+        Log any check result (error or debug level).
+
+        :param str server_name: the server is being checked
+        :param bool status: True if succeeded
+        :param str,None hint: hint to print if not None:
+        :param str,None check: the check name
+        """
+        check = self._check_name(check)
+        if not status:
+            # If the name of the check is not in the filter list,
+            # treat it as a blocking error, then notify the error
+            # and change the status of the strategy
+            if check not in self.ignore_list:
+                self.has_error = True
+                _logger.error(
+                    "Check '{check}' failed for server '{server}'".format(check=check, server=server_name))
+            else:
+                # otherwise simply log the error (as info)
+                _logger.info(
+                    "Ignoring failed check '{check}' for server '{server}'".format(check=check, server=server_name))
+        else:
+            _logger.debug(
+                "Check '{check}' succeeded for server '{server}'".format(check=check, server=server_name))
+
+        # Store the result and does not output anything
+        result = self.CheckResult(server_name, check, status)
+        self.check_result.append(result)
+        self.running_check = None
+
+
+class CheckOutputStrategy(CheckStrategy):
+    """
+    This strategy for the 'check' command immediately sends
+    the result of a check to the designated output channel.
+    This class derives from the basic CheckStrategy, reuses
+    the same logic and adds output messages.
+    """
+
+    def __init__(self):
+        """
+        Output Strategy constructor
+        """
+        super(CheckOutputStrategy, self).__init__(ignore_checks=())
+
+    def result(self, server_name, status, hint=None, check=None):
+        """
+        Store the result of a check.
+        Log any check result (error or debug level).
+        Output the result to the user
+
+        :param str server_name: the server being checked
+        :param str check: the check name
+        :param bool status: True if succeeded
+        :param str,None hint: hint to print if not None:
+        """
+        check = self._check_name(check)
+        super(CheckOutputStrategy, self).result(
+            server_name, status, hint, check)
+        # Send result to output
+        output.result('check', server_name, check, status, hint)
+
+
+class Server(RemoteStatusMixin):
+    """
+    This class represents the MySQL server to backup.
+    """
+
+    # the strategy for the management of the results of the various checks
+    __default_check_strategy = CheckOutputStrategy()
+
+    def __init__(self, config):
+        """
+        Server constructor.
+
+        :param frabit.config.ServerConfig config: the server configuration
+        """
+        super(Server, self).__init__()
+        self.config = config
+        self.path = self._build_path(self.config.path_prefix)
+        self.process_manager = ProcessManager(self.config)
+
+        self.enforce_retention_policies = False
+        self.mysqld = None
+        self.archivers = []
+
+        # Mysql configuration is available only if node is not passive
+        if not self.replica_node:
+            # Initialize the main MySQL connection
+            try:
+                # Check that 'conninfo' option is properly set
+                if config.conninfo is None:
+                    raise ConninfoException(
+                        "Missing 'conninfo' parameter for server '{}'".format(config.name))
+                self.mysql = MySQLConnection(config.conninfo)
+            # If the MySQLConnection creation fails, disable the Server
+            except ConninfoException as e:
+                self.config.disabled = True
+                self.config.msg_list.append(
+                    "MySQL connection: " + force_str(e).strip())
+
+        # Initialize the backup manager
+        self.backup_manager = BackupManager(self)
+
+        if not self.replica_node:
+            # Initialize the StreamingWalArchiver
+            # WARNING: Order of items in self.archivers list is important!
+            # The files will be archived in that order.
+            if self.config.streaming_archiver:
+                try:
+                    self.archivers.append(StreamingWalArchiver(
+                        self.backup_manager))
+                # If the StreamingWalArchiver creation fails,
+                # disable the server
+                except AttributeError as e:
+                    _logger.debug(e)
+                    self.config.disabled = True
+                    self.config.msg_list.append('Unable to initialise the '
+                                                'streaming archiver')
+
+            # IMPORTANT: The following LICENSE of code have been
+            # temporarily commented in order to make the code
+            # back-compatible after the introduction of 'archiver=off'
+            # as default value in Frabit 2.0.
+            # When the back compatibility feature for archiver will be
+            # removed, the following LICENSE need to be decommented.
+            # ARCHIVER_OFF_BACKCOMPATIBILITY - START OF CODE
+            # # At least one of the available archive modes should be enabled
+            # if len(self.archivers) < 1:
+            #     self.config.disabled = True
+            #     self.config.msg_list.append(
+            #         "No archiver enabled for server '%s'. "
+            #         "Please turn on 'archiver', 'streaming_archiver' or both"
+            #         % config.name)
+            # ARCHIVER_OFF_BACKCOMPATIBILITY - END OF CODE
+
+            # Sanity check: if file based archiver is disabled, and only
+            # WAL streaming is enabled, a replication slot name must be
+            # configured.
+            if not self.config.archiver and \
+                    self.config.streaming_archiver and \
+                    self.config.slot_name is None:
+                self.config.disabled = True
+                self.config.msg_list.append(
+                    "Streaming-only archiver requires 'streaming_conninfo' "
+                    "and 'slot_name' options to be properly configured")
+
+            # ARCHIVER_OFF_BACKCOMPATIBILITY - START OF CODE
+            # IMPORTANT: This is a back-compatibility feature that has
+            # been added in Frabit 2.0. It highlights a deprecated
+            # behaviour, and helps users during this transition phase.
+            # It forces 'archiver=on' when both archiver and streaming_archiver
+            # are set to 'off' (default values) and displays a warning,
+            # requesting users to explicitly set the value in the
+            # configuration.
+            # When this back-compatibility feature will be removed from Frabit
+            # (in a couple of major releases), developers will need to remove
+            # this block completely and reinstate the block of code you find
+            # a few LICENSE below (search for ARCHIVER_OFF_BACKCOMPATIBILITY
+            # throughout the code).
+            if self.config.archiver is False and \
+                    self.config.streaming_archiver is False:
+                output.warning("No archiver enabled for server '%s'. "
+                               "Please turn on 'archiver', "
+                               "'streaming_archiver' or both",
+                               self.config.name)
+                output.warning("Forcing 'archiver = on'")
+                self.config.archiver = True
+            # ARCHIVER_OFF_BACKCOMPATIBILITY - END OF CODE
+
+            # Initialize the FileWalArchiver
+            # WARNING: Order of items in self.archivers list is important!
+            # The files will be archived in that order.
+            if self.config.archiver:
+                try:
+                    self.archivers.append(FileWalArchiver(self.backup_manager))
+                except AttributeError as e:
+                    _logger.debug(e)
+                    self.config.disabled = True
+                    self.config.msg_list.append('Unable to initialise the '
+                                                'file based archiver')
+
+        # Set bandwidth_limit
+        if self.config.bandwidth_limit:
+            try:
+                self.config.bandwidth_limit = int(self.config.bandwidth_limit)
+            except ValueError:
+                _logger.warning('Invalid bandwidth_limit "{bd_limit}" for server "{name}" (fallback to "0")'.format(
+                                    bd_limit=self.config.bandwidth_limit,
+                                    name=self.config.name)
+                )
+                self.config.bandwidth_limit = None
+
+        # Set minimum redundancy (default 0)
+        if self.config.minimum_redundancy.isdigit():
+            self.config.minimum_redundancy = int(
+                self.config.minimum_redundancy)
+            if self.config.minimum_redundancy < 0:
+                _logger.warning('Negative value of minimum_redundancy "%s" '
+                                'for server "%s" (fallback to "0")' % (
+                                    self.config.minimum_redundancy,
+                                    self.config.name))
+                self.config.minimum_redundancy = 0
+        else:
+            _logger.warning('Invalid minimum_redundancy "%s" for server "%s" '
+                            '(fallback to "0")' % (
+                                self.config.minimum_redundancy,
+                                self.config.name))
+            self.config.minimum_redundancy = 0
+
+        # Initialise retention policies
+        self._init_retention_policies()
+
+    def _init_retention_policies(self):
+
+        # Set retention policy mode
+        if self.config.retention_policy_mode != 'auto':
+            _logger.warning(
+                'Unsupported retention_policy_mode "%s" for server "%s" '
+                '(fallback to "auto")' % (
+                    self.config.retention_policy_mode, self.config.name))
+            self.config.retention_policy_mode = 'auto'
+
+        # If retention_policy is present, enforce them
+        if self.config.retention_policy:
+            # Check wal_retention_policy
+            if self.config.wal_retention_policy != 'main':
+                _logger.warning(
+                    'Unsupported wal_retention_policy value "%s" '
+                    'for server "%s" (fallback to "main")' % (
+                        self.config.wal_retention_policy, self.config.name))
+                self.config.wal_retention_policy = 'main'
+            # Create retention policy objects
+            try:
+                rp = RetentionPolicyFactory.create(
+                    self, 'retention_policy', self.config.retention_policy)
+                # Reassign the configuration value (we keep it in one place)
+                self.config.retention_policy = rp
+                _logger.debug('Retention policy for server %s: %s' % (
+                    self.config.name, self.config.retention_policy))
+                try:
+                    rp = RetentionPolicyFactory.create(
+                        self, 'wal_retention_policy',
+                        self.config.wal_retention_policy)
+                    # Reassign the configuration value
+                    # (we keep it in one place)
+                    self.config.wal_retention_policy = rp
+                    _logger.debug(
+                        'WAL retention policy for server %s: %s' % (
+                            self.config.name,
+                            self.config.wal_retention_policy))
+                except ValueError:
+                    _logger.exception(
+                        'Invalid wal_retention_policy setting "%s" '
+                        'for server "%s" (fallback to "main")' % (
+                            self.config.wal_retention_policy,
+                            self.config.name))
+                    rp = RetentionPolicyFactory.create(
+                        self, 'wal_retention_policy', 'main')
+                    self.config.wal_retention_policy = rp
+
+                self.enforce_retention_policies = True
+
+            except ValueError:
+                _logger.exception(
+                    'Invalid retention_policy setting "%s" for server "%s"' % (
+                        self.config.retention_policy, self.config.name))
+
+    def get_identity_file_path(self):
+        """
+        Get the path of the file that should contain the identity
+        of the cluster
+        :rtype: str
+        """
+        return os.path.join(
+            self.config.backup_directory,
+            'identity.json')
+
+    def write_identity_file(self):
+        """
+        Store the identity of the server if it doesn't already exist.
+        """
+        file_path = self.get_identity_file_path()
+
+        # Do not write the identity if file already exists
+        if os.path.exists(file_path):
+            return
+
+        systemid = self.systemid
+        if systemid:
+            try:
+                with open(file_path, "w") as fp:
+                    json.dump(
+                        {
+                            "systemid": systemid,
+                            "version": self.mysqld.server_major_version
+                        },
+                        fp,
+                        indent=4,
+                        sort_keys=True)
+                    fp.write("\n")
+            except IOError:
+                _logger.exception(
+                    'Cannot write system Id file for server "%s"' % (
+                        self.config.name))
+
+    def read_identity_file(self):
+        """
+        Read the server identity
+        :rtype: dict[str,str]
+        """
+        file_path = self.get_identity_file_path()
+        try:
+            with open(file_path, "r") as fp:
+                return json.load(fp)
+        except IOError:
+            _logger.exception(
+                'Cannot read system Id file for server "%s"' % (
+                    self.config.name))
+            return {}
+
+    def close(self):
+        """
+        Close all the open connections to MySQL
+        """
+        if self.mysqld:
+            self.mysqld.close()
+
+    def check(self, check_strategy=__default_check_strategy):
+        """
+        Implements the 'server check' command and makes sure SSH and MySQL
+        connections work properly. It checks also that backup directories exist
+        (and if not, it creates them).
+
+        The check command will time out after a time interval defined by the
+        check_timeout configuration value (default 30 seconds)
+
+        :param CheckStrategy check_strategy: the strategy for the management
+             of the results of the various checks
+        """
+        try:
+            with timeout(self.config.check_timeout):
+                # Check WAL archive
+                self.check_archive(check_strategy)
+                # Mysql configuration is not available on passive nodes
+                if not self.replica_node:
+                    self.check_mysql(check_strategy)
+                # Check frabit directories from frabit configuration
+                self.check_directories(check_strategy)
+                # Check retention policies
+                self.check_retention_policy_settings(check_strategy)
+                # Check for backup validity
+                self.check_backup_validity(check_strategy)
+                # Executes the backup manager set of checks
+                self.backup_manager.check(check_strategy)
+                # Check if the msg_list of the server
+                # contains messages and output eventual failures
+                self.check_configuration(check_strategy)
+                # Check the system Id coherence between
+                # streaming and normal connections
+                self.check_identity(check_strategy)
+                # Executes check() for every archiver, passing
+                # remote status information for efficiency
+                for archiver in self.archivers:
+                    archiver.check(check_strategy)
+
+                # Check archiver errors
+                self.check_archiver_errors(check_strategy)
+        except TimeoutError:
+            # The check timed out.
+            # Add a failed entry to the check strategy for this.
+            _logger.debug("Check command timed out executing '%s' check"
+                          % check_strategy.running_check)
+            check_strategy.result(self.config.name, False,
+                                  hint='frabit check command timed out',
+                                  check='check timeout')
+
+    def check_archive(self, check_strategy):
+        """
+        Checks WAL archive
+
+        :param CheckStrategy check_strategy: the strategy for the management
+             of the results of the various checks
+        """
+        check_strategy.init_check("WAL archive")
+        # Make sure that WAL archiving has been setup
+        # XLOG_DB needs to exist and its size must be > 0
+        # NOTE: we do not need to acquire a lock in this phase
+        xlogdb_empty = True
+        if os.path.exists(self.xlogdb_file_name):
+            with open(self.xlogdb_file_name, "rb") as fxlogdb:
+                if os.fstat(fxlogdb.fileno()).st_size > 0:
+                    xlogdb_empty = False
+
+        # NOTE: This check needs to be only visible if it fails
+        if xlogdb_empty:
+            # Skip the error if we have a terminated backup
+            # with status WAITING_FOR_WALS.
+            # TODO: Improve this check
+            backup_id = self.get_last_backup_id([BackupInfo.WAITING_FOR_WALS])
+            if not backup_id:
+                check_strategy.result(
+                    self.config.name, False,
+                    hint='please make sure WAL shipping is setup')
+
+        # Check the number of wals in the incoming directory
+        self._check_wal_queue(check_strategy,
+                              'incoming',
+                              'archiver')
+
+        # Check the number of wals in the streaming directory
+        self._check_wal_queue(check_strategy,
+                              'streaming',
+                              'streaming_archiver')
+
+    def _check_wal_queue(self, check_strategy, dir_name, archiver_name):
+        """
+        Check if one of the wal queue directories beyond the
+        max file threshold
+        """
+        # Read the wal queue location from the configuration
+        config_name = "%s_wals_directory" % dir_name
+        assert hasattr(self.config, config_name)
+        incoming_dir = getattr(self.config, config_name)
+
+        # Check if the archiver is enabled
+        assert hasattr(self.config, archiver_name)
+        enabled = getattr(self.config, archiver_name)
+
+        # Inspect the wal queue directory
+        file_count = 0
+        for file_item in glob(os.path.join(incoming_dir, '*')):
+            # Ignore temporary files
+            if file_item.endswith('.tmp'):
+                continue
+            file_count += 1
+        max_incoming_wal = self.config.max_incoming_wals_queue
+
+        # Subtract one from the count because of .partial file inside the
+        # streaming directory
+        if dir_name == 'streaming':
+            file_count -= 1
+
+        # If this archiver is disabled, check the number of files in the
+        # corresponding directory.
+        # If the directory is NOT empty, fail the check and warn the user.
+        # NOTE: This check is visible only when it fails
+        check_strategy.init_check("empty %s directory" % dir_name)
+        if not enabled:
+            if file_count > 0:
+                check_strategy.result(
+                    self.config.name, False,
+                    hint="'%s' must be empty when %s=off"
+                         % (incoming_dir, archiver_name))
+            # No more checks are required if the archiver
+            # is not enabled
+            return
+
+        # At this point if max_wals_count is none,
+        # means that no limit is set so we just need to return
+        if max_incoming_wal is None:
+            return
+        check_strategy.init_check("%s WALs directory" % dir_name)
+        if file_count > max_incoming_wal:
+            msg = 'there are too many WALs in queue: ' \
+                  '%s, max %s' % (file_count, max_incoming_wal)
+            check_strategy.result(self.config.name, False, hint=msg)
+
+    def check_mysql(self, check_strategy):
+        """
+        Checks MySQL connection
+
+        :param CheckStrategy check_strategy: the strategy for the management
+             of the results of the various checks
+        """
+        check_strategy.init_check('MySQL')
+        # Take the status of the remote server
+        remote_status = self.get_remote_status()
+        if remote_status.get('server_txt_version'):
+            check_strategy.result(self.config.name, True)
+        else:
+            check_strategy.result(self.config.name, False)
+            return
+
+        # Check for superuser privileges or
+        # privileges needed to perform backups
+        if remote_status.get('has_backup_privileges') is not None:
+            check_strategy.init_check(
+                'superuser or standard user with backup privileges')
+            if remote_status.get('has_backup_privileges'):
+                check_strategy.result(
+                    self.config.name, True)
+            else:
+                check_strategy.result(
+                    self.config.name, False,
+                    hint='privileges for PostgreSQL backup functions are '
+                         'required (see documentation)',
+                    check='no access to backup functions'
+                )
+
+        if 'wal_level' in remote_status:
+            check_strategy.init_check("wal_level")
+            if remote_status['wal_level'] != 'minimal':
+                check_strategy.result(
+                    self.config.name, True)
+            else:
+                check_strategy.result(
+                    self.config.name, False,
+                    hint="please set it to a higher level than 'minimal'")
+
+        # Check the presence and the status of the configured replication slot
+        # This check will be skipped if `slot_name` is undefined
+        if self.config.slot_name:
+            check_strategy.init_check("replication slot")
+            slot = remote_status['replication_slot']
+            # The streaming_archiver is enabled
+            if self.config.streaming_archiver is True:
+                # Error if PostgreSQL is too old
+                if not remote_status['replication_slot_support']:
+                    check_strategy.result(
+                        self.config.name,
+                        False,
+                        hint="slot_name parameter set but PostgreSQL server "
+                             "is too old (%s < 9.4)" %
+                             remote_status['server_txt_version'])
+                # Replication slots are supported
+                else:
+                    # The slot is not present
+                    if slot is None:
+                        check_strategy.result(
+                            self.config.name, False,
+                            hint="replication slot '%s' doesn't exist. "
+                                 "Please execute 'frabit receive-wal "
+                                 "--create-slot %s'" % (self.config.slot_name,
+                                                        self.config.name))
+                    else:
+                        # The slot is present but not initialised
+                        if slot.restart_lsn is None:
+                            check_strategy.result(
+                                self.config.name, False,
+                                hint="slot '%s' not initialised: is "
+                                     "'receive-wal' running?" %
+                                     self.config.slot_name)
+                        # The slot is present but not active
+                        elif slot.active is False:
+                            check_strategy.result(
+                                self.config.name, False,
+                                hint="slot '%s' not active: is "
+                                     "'receive-wal' running?" %
+                                     self.config.slot_name)
+                        else:
+                            check_strategy.result(self.config.name,
+                                                  True)
+            else:
+                # If the streaming_archiver is disabled and the slot_name
+                # option is present in the configuration, we check that
+                # a replication slot with the specified name is NOT present
+                # and NOT active.
+                # NOTE: This is not a failure, just a warning.
+                if slot is not None:
+                    if slot.restart_lsn \
+                            is not None:
+                        slot_status = 'initialised'
+
+                        # Check if the slot is also active
+                        if slot.active:
+                            slot_status = 'active'
+
+                        # Warn the user
+                        check_strategy.result(
+                            self.config.name,
+                            True,
+                            hint="WARNING: slot '%s' is %s but not required "
+                                 "by the current config" % (
+                                     self.config.slot_name, slot_status))
+
+    def _make_directories(self):
+        """
+        Make backup directories in case they do not exist
+        """
+        for key in self.config.KEYS:
+            if key.endswith('_directory') and hasattr(self.config, key):
+                val = getattr(self.config, key)
+                if val is not None and not os.path.isdir(val):
+                    # noinspection PyTypeChecker
+                    os.makedirs(val)
+
+    def check_directories(self, check_strategy):
+        """
+        Checks backup directories and creates them if they do not exist
+
+        :param CheckStrategy check_strategy: the strategy for the management
+             of the results of the various checks
+        """
+        check_strategy.init_check("directories")
+        if not self.config.disabled:
+            try:
+                self._make_directories()
+            except OSError as e:
+                check_strategy.result(self.config.name, False,
+                                      "{filename}: {strerror}".format(filename=e.filename, strerror=e.strerror))
+            else:
+                check_strategy.result(self.config.name, True)
+
+    def check_configuration(self, check_strategy):
+        """
+        Check for error messages in the message list
+        of the server and output eventual errors
+
+        :param CheckStrategy check_strategy: the strategy for the management
+             of the results of the various checks
+        """
+        check_strategy.init_check('configuration')
+        if len(self.config.msg_list):
+            check_strategy.result(self.config.name, False)
+            for conflict_paths in self.config.msg_list:
+                output.info("\t\t{}".format(conflict_paths))
+
+    def check_retention_policy_settings(self, check_strategy):
+        """
+        Checks retention policy setting
+
+        :param CheckStrategy check_strategy: the strategy for the management
+             of the results of the various checks
+        """
+        check_strategy.init_check("retention policy settings")
+        config = self.config
+        if config.retention_policy and not self.enforce_retention_policies:
+            check_strategy.result(self.config.name, False, hint='see log')
+        else:
+            check_strategy.result(self.config.name, True)
+
+    def check_backup_validity(self, check_strategy):
+        """
+        Check if backup validity requirements are satisfied
+
+        :param CheckStrategy check_strategy: the strategy for the management
+             of the results of the various checks
+        """
+        check_strategy.init_check('backup maximum age')
+        # first check: check backup maximum age
+        if self.config.last_backup_maximum_age is not None:
+            # get maximum age information
+            backup_age = self.backup_manager.validate_last_backup_maximum_age(
+                self.config.last_backup_maximum_age)
+
+            # format the output
+            check_strategy.result(
+                self.config.name, backup_age[0],
+                hint="interval provided:{max_age}, latest backup age:{age}".format(
+                    max_age=human_readable_timedelta(self.config.last_backup_maximum_age), age=backup_age[1])
+            )
+        else:
+            # last_backup_maximum_age provided by the user
+            check_strategy.result(
+                self.config.name,
+                True,
+                hint="no last_backup_maximum_age provided")
+
+    def check_archiver_errors(self, check_strategy):
+        """
+        Checks the presence of archiving errors
+
+        :param CheckStrategy check_strategy: the strategy for the management
+             of the results of the check
+        """
+        check_strategy.init_check('archiver errors')
+        if os.path.isdir(self.config.errors_directory):
+            errors = os.listdir(self.config.errors_directory)
+        else:
+            errors = []
+
+        check_strategy.result(
+            self.config.name,
+            len(errors) == 0,
+            hint=BinlogArchiver.summarise_error_files(errors)
+        )
+
+    def check_identity(self, check_strategy):
+        """
+        Check the systemid retrieved from the streaming connection
+        is the same that is retrieved from the standard connection,
+        and then verifies it matches the one stored on disk.
+
+        :param CheckStrategy check_strategy: the strategy for the management
+             of the results of the various checks
+        """
+        check_strategy.init_check("systemid coherence")
+
+        remote_status = self.get_remote_status()
+
+        # Get system identifier from streaming and standard connections
+        systemid_from_streaming = remote_status.get('streaming_systemid')
+        systemid_from_postgres = remote_status.get('postgres_systemid')
+        # If both available, makes sure they are coherent with each other
+        if systemid_from_streaming and systemid_from_postgres:
+            if systemid_from_streaming != systemid_from_postgres:
+                check_strategy.result(
+                    self.config.name,
+                    systemid_from_streaming == systemid_from_postgres,
+                    hint="is the streaming DSN targeting the same server "
+                         "of the PostgreSQL connection string?")
+                return
+
+        systemid_from_server = (
+            systemid_from_streaming or systemid_from_postgres)
+        if not systemid_from_server:
+            # Can't check without system Id information
+            check_strategy.result(self.config.name, True,
+                                  hint="no system Id available")
+            return
+
+        # Retrieves the content on disk and matches it with the live ID
+        file_path = self.get_identity_file_path()
+        if not os.path.exists(file_path):
+            # We still don't have the systemid cached on disk,
+            # so let's wait until we store it
+            check_strategy.result(self.config.name, True,
+                                  hint="no system Id stored on disk")
+            return
+
+        identity_from_file = self.read_identity_file()
+        if systemid_from_server != identity_from_file.get('systemid'):
+            check_strategy.result(
+                self.config.name,
+                False,
+                hint='the system Id of the connected PostgreSQL server '
+                     'changed, stored in "%s"' % file_path)
+        else:
+            check_strategy.result(self.config.name, True)
+
+    def status_mysql(self):
+        """
+        Status of MySQL server
+        """
+        remote_status = self.get_remote_status()
+        if remote_status['server_txt_version']:
+            output.result('status', self.config.name,
+                          "pg_version",
+                          "PostgreSQL version",
+                          remote_status['server_txt_version'])
+        else:
+            output.result('status', self.config.name,
+                          "pg_version",
+                          "PostgreSQL version",
+                          "FAILED trying to get PostgreSQL version")
+            return
+        # Define the cluster state as pg_controldata do.
+        if remote_status['is_in_recovery']:
+            output.result('status', self.config.name, 'is_in_recovery',
+                          'Cluster state', "in archive recovery")
+        else:
+            output.result('status', self.config.name, 'is_in_recovery',
+                          'Cluster state', "in production")
+        if remote_status['pgespresso_installed']:
+            output.result('status', self.config.name, 'pgespresso',
+                          'pgespresso extension', "Available")
+        else:
+            output.result('status', self.config.name, 'pgespresso',
+                          'pgespresso extension', "Not available")
+        if remote_status.get('current_size') is not None:
+            output.result('status', self.config.name,
+                          'current_size',
+                          'Current data size',
+                          pretty_size(remote_status['current_size']))
+        if remote_status['data_directory']:
+            output.result('status', self.config.name,
+                          "data_directory",
+                          "PostgreSQL Data directory",
+                          remote_status['data_directory'])
+        if remote_status['current_xlog']:
+            output.result('status', self.config.name,
+                          "current_xlog",
+                          "Current WAL segment",
+                          remote_status['current_xlog'])
+
+    def status_wal_archiver(self):
+        """
+        Status of WAL archiver(s)
+        """
+        for archiver in self.archivers:
+            archiver.status()
+
+    def status_retention_policies(self):
+        """
+        Status of retention policies enforcement
+        """
+        if self.enforce_retention_policies:
+            output.result('status', self.config.name,
+                          "retention_policies",
+                          "Retention policies",
+                          "enforced "
+                          "(mode:{mode}, retention: {retention}, binlog retention: {bin_retention})".format(
+                              mode=self.config.retention_policy_mode,
+                              retention=self.config.retention_policy,
+                              bin_retention=self.config.binlog_retention_policy))
+        else:
+            output.result('status', self.config.name,
+                          "retention_policies",
+                          "Retention policies",
+                          "not enforced")
+
+    def status(self):
+        """
+        Implements the 'server-status' command.
+        """
+        if self.config.description:
+            output.result('status', self.config.name,
+                          "description",
+                          "Description", self.config.description)
+        output.result('status', self.config.name,
+                      "active",
+                      "Active", self.config.active)
+        output.result('status', self.config.name,
+                      "disabled",
+                      "Disabled", self.config.disabled)
+
+        # Mysql status is available only if node is not passive
+        if not self.replica_node:
+            self.status_postgres()
+            self.status_wal_archiver()
+
+        output.result('status', self.config.name,
+                      "replica_node",
+                      "Passive node",
+                      self.replica_node)
+
+        self.status_retention_policies()
+        # Executes the backup manager status info method
+        self.backup_manager.status()
+
+    def fetch_remote_status(self):
+        """
+        Get the status of the remote server
+
+        This method does not raise any exception in case of errors,
+        but set the missing values to None in the resulting dictionary.
+
+        :rtype: dict[str, None|str]
+        """
+        result = {}
+        # Merge status for a MySQL connection
+        if self.mysqld:
+            result.update(self.mysqld.get_remote_status())
+        # Merge status for each archiver
+        for archiver in self.archivers:
+            result.update(archiver.get_remote_status())
+        # Merge status defined by the BackupManager
+        result.update(self.backup_manager.get_remote_status())
+        return result
+
+    def show(self):
+        """
+        Shows the server configuration
+        """
+        # Populate result map with all the required keys
+        result = self.config.to_json()
+        # Is the server a replica node?
+        result['replica_node'] = self.replica_node
+        # Skip remote status if the server is replica
+        if not self.replica_node:
+            remote_status = self.get_remote_status()
+            result.update(remote_status)
+        # Backup maximum age section
+        if self.config.last_backup_maximum_age is not None:
+            age = self.backup_manager.validate_last_backup_maximum_age(
+                self.config.last_backup_maximum_age)
+            # If latest backup is between the limits of the
+            # last_backup_maximum_age configuration, display how old is
+            # the latest backup.
+            if age[0]:
+                msg = "%s (latest backup: %s )" % \
+                    (human_readable_timedelta(
+                        self.config.last_backup_maximum_age),
+                     age[1])
+            else:
+                # If latest backup is outside the limits of the
+                # last_backup_maximum_age configuration (or the configuration
+                # value is none), warn the user.
+                msg = "%s (WARNING! latest backup is %s old)" % \
+                    (human_readable_timedelta(
+                        self.config.last_backup_maximum_age),
+                     age[1])
+            result['last_backup_maximum_age'] = msg
+        else:
+            result['last_backup_maximum_age'] = "None"
+        output.result('show_server', self.config.name, result)
+
+    def delete_backup(self, backup):
+        """Deletes a backup
+
+        :param backup: the backup to delete
+        """
+        try:
+            # Lock acquisition: if you can acquire a ServerBackupLock
+            # it means that no backup process is running on that server,
+            # so there is no need to check the backup status.
+            # Simply proceed with the normal delete process.
+            server_backup_lock = ServerBackupLock(
+                self.config.frabit_lock_directory,
+                self.config.name)
+            server_backup_lock.acquire(server_backup_lock.raise_if_fail,
+                                       server_backup_lock.wait)
+            server_backup_lock.release()
+
+        except LockFileBusy:
+            # Otherwise if the lockfile is busy, a backup process is actually
+            # running on that server. To be sure that it's safe
+            # to delete the backup, we must check its status and its position
+            # in the catalogue.
+            # If it is the first and it is STARTED or EMPTY, we are trying to
+            # remove a running backup. This operation must be forbidden.
+            # Otherwise, normally delete the backup.
+            first_backup_id = self.get_first_backup_id(BackupInfo.STATUS_ALL)
+            if backup.backup_id == first_backup_id \
+                    and backup.status in (BackupInfo.STARTED,
+                                          BackupInfo.EMPTY):
+                output.error("Cannot delete a running backup (%s %s)"
+                             % (self.config.name, backup.backup_id))
+                return
+
+        except LockFilePermissionDenied as e:
+            # We cannot access the lockfile.
+            # Exit without removing the backup.
+            output.error("Permission denied, unable to access '%s'" % e)
+            return
+
+        try:
+            # Take care of the backup lock.
+            # Only one process can modify a backup at a time
+            lock = ServerBackupIdLock(self.config.frabit_lock_directory,
+                                      self.config.name,
+                                      backup.backup_id)
+            with lock:
+                deleted = self.backup_manager.delete_backup(backup)
+
+            # At this point no-one should try locking a backup that
+            # doesn't exists, so we can remove the lock
+            # WARNING: the previous statement is true only as long as
+            # no-one wait on this lock
+            if deleted:
+                os.remove(lock.filename)
+
+            return deleted
+
+        except LockFileBusy:
+            # If another process is holding the backup lock,
+            # warn the user and terminate
+            output.error(
+                "Another process is holding the lock for "
+                "backup %s of server %s." % (
+                    backup.backup_id, self.config.name))
+            return
+
+        except LockFilePermissionDenied as e:
+            # We cannot access the lockfile.
+            # warn the user and terminate
+            output.error("Permission denied, unable to access '%s'" % e)
+            return
+
+    def backup(self, wait=False, wait_timeout=None):
+        """
+        Performs a backup for the server
+        :param bool wait: wait for all the required binlog files to be archived
+        :param int|None wait_timeout: the time, in seconds, the backup
+            will wait for the required binlog files to be archived
+            before timing out
+        """
+
+        try:
+            # Default strategy for check in backup is CheckStrategy
+            # This strategy does not print any output - it only logs checks
+            strategy = CheckStrategy()
+            self.check(strategy)
+            if strategy.has_error:
+                output.error("Impossible to start the backup. Check the log for more details, or "
+                             "run 'frabit check {name}'".format(name=self.config.name)
+                             )
+                return
+            # check required backup directories exist
+            self._make_directories()
+        except OSError as e:
+            output.error('failed to create {file} directory: {error}'.format(file=e.filename, error=e.strerror))
+            return
+
+        # Save the database identity
+        self.write_identity_file()
+
+        try:
+            # lock acquisition and backup execution
+            with ServerBackupLock(self.config.frabit_lock_directory, self.config.name):
+                backup_info = self.backup_manager.backup(wait=wait, wait_timeout=wait_timeout)
+
+            # Archive incoming WALs and update WAL catalogue
+            self.archive_wal(verbose=False)
+
+            # Invoke sanity check of the backup
+            if backup_info.status == BackupInfo.WAITING_FOR_WALS:
+                self.check_backup(backup_info)
+
+            # At this point is safe to remove any remaining WAL file before the first backup
+            previous_backup = self.get_previous_backup(backup_info.backup_id)
+            if not previous_backup:
+                self.backup_manager.remove_binlog_before_backup(backup_info)
+
+            if backup_info.status == BackupInfo.WAITING_FOR_WALS:
+                output.warning(
+                    "IMPORTANT: this backup is classified as "
+                    "WAITING_FOR_WALS, meaning that Frabit has not received "
+                    "yet all the required WAL files for the backup "
+                    "consistency.\n"
+                    "This is a common behaviour in concurrent backup "
+                    "scenarios, and Frabit automatically set the backup as "
+                    "DONE once all the required WAL files have been "
+                    "archived.\n"
+                    "Hint: execute the backup command with '--wait'")
+        except LockFileBusy:
+            output.error("Another backup process is running")
+
+        except LockFilePermissionDenied as e:
+            output.error("Permission denied, unable to access '{}'".format(e))
+
+    def get_available_backups(self, status_filter=BackupManager.DEFAULT_STATUS_FILTER):
+        """
+        Get a list of available backups
+
+        param: status_filter: the status of backups to return, default to BackupManager.DEFAULT_STATUS_FILTER
+        """
+        return self.backup_manager.get_available_backups(status_filter)
+
+    def get_last_backup_id(self, status_filter=BackupManager.DEFAULT_STATUS_FILTER):
+        """
+        Get the id of the latest/last backup in the catalog (if exists)
+
+        :param status_filter: The status of the backup to return, default to DEFAULT_STATUS_FILTER.
+        :return string|None: ID of the backup
+        """
+        return self.backup_manager.get_last_backup_id(status_filter)
+
+    def get_first_backup_id(self, status_filter=BackupManager.DEFAULT_STATUS_FILTER):
+        """
+        Get the id of the oldest/first backup in the catalog (if exists)
+
+        :param status_filter: The status of the backup to return, default to DEFAULT_STATUS_FILTER.
+        :return string|None: ID of the backup
+        """
+        return self.backup_manager.get_first_backup_id(status_filter)
+
+    def list_backups(self):
+        """
+        Lists all the available backups for the server
+        """
+        retention_status = self.report_backups()
+        backups = self.get_available_backups(BackupInfo.STATUS_ALL)
+        for key in sorted(backups.keys(), reverse=True):
+            backup = backups[key]
+
+            backup_size = backup.size or 0
+            wal_size = 0
+            rstatus = None
+            if backup.status in BackupInfo.STATUS_COPY_DONE:
+                try:
+                    wal_info = self.get_wal_info(backup)
+                    backup_size += wal_info['wal_size']
+                    wal_size = wal_info['wal_until_next_size']
+                except BadBinlogfileName as e:
+                    output.error(
+                        "invalid WAL segment name %r\n"
+                        "HINT: Please run \"frabit rebuild-xlogdb %s\" "
+                        "to solve this issue",
+                        force_str(e), self.config.name)
+                if self.enforce_retention_policies and \
+                        retention_status[backup.backup_id] != BackupInfo.VALID:
+                    rstatus = retention_status[backup.backup_id]
+            output.result('list_backup', backup, backup_size, wal_size, rstatus)
+
+    def get_backup(self, backup_id):
+        """
+        Return the backup information for the given backup id.
+
+        If the backup_id is None or backup.info file doesn't exists, it returns None.
+
+        :param str|None backup_id: the ID of the backup to return
+        :rtype: frabit.info.LocalBackupInfo|None
+        """
+        return self.backup_manager.get_backup(backup_id)
+
+    def get_previous_backup(self, backup_id):
+        """
+        Get the previous backup (if any) from the catalog
+
+        :param backup_id: the backup id from which return the previous
+        """
+        return self.backup_manager.get_previous_backup(backup_id)
+
+    def get_next_backup(self, backup_id):
+        """
+        Get the next backup (if any) from the catalog
+
+        :param backup_id: the backup id from which return the next
+        """
+        return self.backup_manager.get_next_backup(backup_id)
+
+    def get_required_binlog_files(self, backup, target_tli=None, target_time=None, target_xid=None):
+        """
+        Get the binlog files required for a recovery
+        """
+        begin = backup.begin_binlog
+        end = backup.end_binlog
+        with self.xlogdb() as fxlogdb:
+            for line in fxlogdb:
+                binlog_info = BinlogInfo.from_binlog_line(line)
+                # Handle .history files: add all of them to the output,
+                # regardless of their age
+                if binlog.is_history_file(binlog_info.name):
+                    yield binlog_info
+                    continue
+                if binlog_info.name < begin:
+                    continue
+                tli, _, _ = xlog.decode_segment_name(binlog_info.name)
+                if tli > target_tli:
+                    continue
+                yield binlog_info
+                if binlog_info.name > end:
+                    end = binlog_info.name
+                    if target_time and target_time < binlog_info.time:
+                        break
+            # return all the remaining history files
+            for line in fxlogdb:
+                wal_info = BinlogInfo.from_binlog_line(line)
+                if binlog.is_history_file(wal_info.name):
+                    yield wal_info
+
+    # TODO: merge with the previous
+    def get_binlog_until_next_backup(self, backup, include_history=False):
+        """
+        Get the xlog files between backup and the next
+
+        :param BackupInfo backup: a backup object, the starting point
+            to retrieve WALs
+        :param bool include_history: option for the inclusion of
+            include_history files into the output
+        """
+        begin = backup.begin_wal
+        next_end = None
+        if self.get_next_backup(backup.backup_id):
+            next_end = self.get_next_backup(backup.backup_id).end_wal
+        backup_tli, _, _ = xlog.decode_segment_name(begin)
+
+        with self.xlogdb() as fxlogdb:
+            for line in fxlogdb:
+                wal_info = WalFileInfo.from_binlog_line(line)
+                # Handle .history files: add all of them to the output,
+                # regardless of their age, if requested (the 'include_history'
+                # parameter is True)
+                if xlog.is_history_file(wal_info.name):
+                    if include_history:
+                        yield wal_info
+                    continue
+                if wal_info.name < begin:
+                    continue
+                tli, _, _ = xlog.decode_segment_name(wal_info.name)
+                if tli > backup_tli:
+                    continue
+                if not xlog.is_wal_file(wal_info.name):
+                    continue
+                if next_end and wal_info.name > next_end:
+                    break
+                yield wal_info
+
+    def get_binlog_full_path(self, binlog_name):
+        """
+        Build the full path of a WAL for a server given the name
+
+        :param binlog_name: binlog file name
+        """
+        # Build the path which contains the file
+        hash_dir = os.path.join(self.config.wals_directory, binlog.hash_dir(binlog_name))
+        # Build the WAL file full path
+        full_path = os.path.join(hash_dir, binlog_name)
+        return full_path
+
+    def get_binlog_possible_paths(self, wal_name, partial=False):
+        """
+        Build a list of possible positions of a WAL file
+
+        :param str wal_name: WAL file name
+        :param bool partial: add also the '.partial' paths
+        """
+        paths = list()
+
+        # Path in the archive
+        hash_dir = os.path.join(self.config.wals_directory,
+                                xlog.hash_dir(wal_name))
+        full_path = os.path.join(hash_dir, wal_name)
+        paths.append(full_path)
+
+        # Path in incoming directory
+        incoming_path = os.path.join(self.config.incoming_wals_directory,
+                                     wal_name)
+        paths.append(incoming_path)
+
+        # Path in streaming directory
+        streaming_path = os.path.join(self.config.streaming_wals_directory,
+                                      wal_name)
+        paths.append(streaming_path)
+
+        # If partial files are required check also the '.partial' path
+        if partial:
+            paths.append(streaming_path + PARTIAL_EXTENSION)
+            # Add the streaming_path again to handle races with pg_receivewal
+            # completing the WAL file
+            paths.append(streaming_path)
+            # The following two path are only useful to retrieve the last
+            # incomplete segment archived before a promotion.
+            paths.append(full_path + PARTIAL_EXTENSION)
+            paths.append(incoming_path + PARTIAL_EXTENSION)
+
+        # Append the archive path again, to handle races with the archiver
+        paths.append(full_path)
+
+        return paths
+
+    def get_binlog_info(self, backup_info):
+        """
+        Returns information about Binlogs for the given backup
+
+        :param frabit.info.LocalBackupInfo backup_info: the target backup
+        """
+        begin = backup_info.begin_binlog
+        end = backup_info.end_binlog
+
+        # counters
+        binlog_info = dict.fromkeys(
+            ('binlog_num', 'binlog_size',
+             'binlog_until_next_num', 'binlog_until_next_size',
+             'binlog_until_next_compression_ratio',
+             'binlog_compression_ratio'), 0)
+        # First binlog (always equal to begin_wal) and Last binlog names and ts
+        binlog_info['binlog_first'] = None
+        binlog_info['binlog_first_timestamp'] = None
+        binlog_info['binlog_last'] = None
+        binlog_info['binlog_last_timestamp'] = None
+
+        for item in self.get_binlog_until_next_backup(backup_info):
+            if item.name == begin:
+                binlog_info['binlog_first'] = item.name
+                binlog_info['binlog_first_timestamp'] = item.time
+            if item.name <= end:
+                binlog_info['binlog_num'] += 1
+                binlog_info['binlog_size'] += item.size
+            else:
+                binlog_info['binlog_until_next_num'] += 1
+                binlog_info['binlog_until_next_size'] += item.size
+            binlog_info['binlog_last'] = item.name
+            binlog_info['binlog_last_timestamp'] = item.time
+
+        # Calculate statistics only for complete backups
+        # If the cron is not running for any reason, the required binlog files could be missing
+        if binlog_info['binlog_first'] and binlog_info['binlog_last']:
+            # Estimate WAL ratio
+            # Calculate the difference between the timestamps of
+            # the first WAL (begin of backup) and the last WAL
+            # associated to the current backup
+            wal_last_timestamp = binlog_info['binlog_first_timestamp']
+            wal_first_timestamp = binlog_info['binlog_first_timestamp']
+            binlog_info['wal_total_seconds'] = (
+                wal_last_timestamp - wal_first_timestamp)
+            if binlog_info['wal_total_seconds'] > 0:
+                wal_num = binlog_info['wal_num']
+                wal_until_next_num = binlog_info['wal_until_next_num']
+                wal_total_seconds = binlog_info['wal_total_seconds']
+                binlog_info['wals_per_second'] = (
+                    float(wal_num + wal_until_next_num) / wal_total_seconds)
+
+            # evaluation of compression ratio for basebackup WAL files
+            binlog_info['wal_theoretical_size'] = \
+                binlog_info['wal_num'] * float(backup_info.binlog_file_size)
+            try:
+                wal_size = binlog_info['wal_size']
+                binlog_info['wal_compression_ratio'] = (
+                    1 - (wal_size / binlog_info['wal_theoretical_size']))
+            except ZeroDivisionError:
+                binlog_info['wal_compression_ratio'] = 0.0
+
+            # evaluation of compression ratio of WAL files
+            wal_until_next_num = binlog_info['wal_until_next_num']
+            binlog_info['wal_until_next_theoretical_size'] = (
+                wal_until_next_num * float(backup_info.binlog_file_size))
+            try:
+                wal_until_next_size = binlog_info['wal_until_next_size']
+                until_next_theoretical_size = (
+                    binlog_info['wal_until_next_theoretical_size'])
+                binlog_info['wal_until_next_compression_ratio'] = (
+                    1 - (wal_until_next_size / until_next_theoretical_size))
+            except ZeroDivisionError:
+                binlog_info['wal_until_next_compression_ratio'] = 0.0
+
+        return binlog_info
+
+    def recover(self, backup_info, dest, tablespaces=None, remote_command=None, **kwargs):
+        """
+        Performs a recovery of a backup
+
+        :param frabit.info.LocalBackupInfo backup_info: the backup
+            to recover
+        :param str dest: the destination directory
+        :param dict[str,str]|None tablespaces: a tablespace
+            name -> location map (for relocation)
+        :param str|None remote_command: default None. The remote command to
+            recover the base backup, in case of remote backup.
+        :kwparam str|None target_tli: the target timeline
+        :kwparam str|None target_time: the target time
+        :kwparam str|None target_xid: the target xid
+        :kwparam str|None target_lsn: the target LSN
+        :kwparam str|None target_name: the target name created previously with
+                            pg_create_restore_point() function call
+        :kwparam bool|None target_immediate: end recovery as soon as consistency is reached
+        :kwparam bool exclusive: whether the recovery is exclusive or not
+        :kwparam str|None target_action: the recovery target action
+        :kwparam bool|None standby_mode: the standby mode
+        """
+        return self.backup_manager.recover(
+            backup_info, dest, tablespaces, remote_command, **kwargs)
+
+    def get_wal(self, wal_name, compression=None, output_directory=None, peek=None, partial=False):
+        """
+        Retrieve a WAL file from the archive
+
+        :param str wal_name: id of the WAL file to find into the WAL archive
+        :param str|None compression: compression format for the output
+        :param str|None output_directory: directory where to deposit the
+            WAL file
+        :param int|None peek: if defined list the next N WAL file
+        :param bool partial: retrieve also partial WAL files
+        """
+
+        # If used through SSH identify the client to add it to logs
+        source_suffix = ''
+        ssh_connection = os.environ.get('SSH_CONNECTION')
+        if ssh_connection:
+            # The client IP is the first value contained in `SSH_CONNECTION`
+            # which contains four space-separated values: client IP address,
+            # client port number, server IP address, and server port number.
+            source_suffix = ' (SSH host: %s)' % (ssh_connection.split()[0],)
+
+        # Sanity check
+        if not xlog.is_any_xlog_file(wal_name):
+            output.error("'%s' is not a valid wal file name%s",
+                         wal_name, source_suffix)
+            return
+
+        # If peek is requested we only output a list of files
+        if peek:
+            # Get the next ``peek`` files following the provided ``wal_name``.
+            # If ``wal_name`` is not a simple wal file,
+            # we cannot guess the names of the following WAL files.
+            # So ``wal_name`` is the only possible result, if exists.
+            if xlog.is_wal_file(wal_name):
+                # We can't know what was the segment size of PostgreSQL WAL
+                # files at backup time. Because of this, we generate all
+                # the possible names for a WAL segment, and then we check
+                # if the requested one is included.
+                wal_peek_list = xlog.generate_binlog_names(wal_name)
+            else:
+                wal_peek_list = iter([wal_name])
+
+            # Output the content of wal_peek_list until we have displayed
+            # enough files or find a missing file
+            count = 0
+            while count < peek:
+                try:
+                    wal_peek_name = next(wal_peek_list)
+                except StopIteration:
+                    # No more item in wal_peek_list
+                    break
+
+                # Get list of possible location. We do not prefetch
+                # partial files
+                wal_peek_paths = self.get_wal_possible_paths(wal_peek_name,
+                                                             partial=False)
+
+                # If the next WAL file is found, output the name
+                # and continue to the next one
+                if any(os.path.exists(path) for path in wal_peek_paths):
+                    count += 1
+                    output.info(wal_peek_name, log=False)
+                    continue
+
+                # If ``wal_peek_file`` doesn't exist, check if we need to
+                # look in the following segment
+                tli, log, seg = xlog.decode_segment_name(wal_peek_name)
+
+                # If `seg` is not a power of two, it is not possible that we
+                # are at the end of a WAL group, so we are done
+                if not is_power_of_two(seg):
+                    break
+
+                # This is a possible WAL group boundary, let's try the
+                # following group
+                seg = 0
+                log += 1
+
+                # Install a new generator from the start of the next segment.
+                # If the file doesn't exists we will terminate because
+                # zero is not a power of two
+                wal_peek_name = xlog.encode_segment_name(tli, log, seg)
+                wal_peek_list = xlog.generate_binlog_names(wal_peek_name)
+
+            # Do not output anything else
+            return
+
+        # If an output directory was provided write the file inside it
+        # otherwise we use standard output
+        if output_directory is not None:
+            destination_path = os.path.join(output_directory, wal_name)
+            destination_description = "into '%s' file" % destination_path
+            # Use the standard output for messages
+            logger = output
+            try:
+                destination = open(destination_path, 'wb')
+            except IOError as e:
+                output.error("Unable to open '%s' file%s: %s",
+                             destination_path, source_suffix, e)
+                return
+        else:
+            destination_description = 'to standard output'
+            # Do not use the standard output for messages, otherwise we would
+            # taint the output stream
+            logger = _logger
+            try:
+                # Python 3.x
+                destination = sys.stdout.buffer
+            except AttributeError:
+                # Python 2.x
+                destination = sys.stdout
+
+        # Get the list of WAL file possible paths
+        wal_paths = self.get_wal_possible_paths(wal_name, partial)
+
+        for wal_file in wal_paths:
+
+            # Check for file existence
+            if not os.path.exists(wal_file):
+                continue
+
+            logger.info(
+                "Sending WAL '%s' for server '%s' %s%s",
+                os.path.basename(wal_file), self.config.name,
+                destination_description, source_suffix)
+
+            try:
+                # Try returning the wal_file to the client
+                self.get_wal_sendfile(wal_file, compression, destination)
+                # We are done, return to the caller
+                return
+            except CommandFailedException:
+                # If an external command fails we cannot really know why,
+                # but if the WAL file disappeared, we assume
+                # it has been moved in the archive so we ignore the error.
+                # This file will be retrieved later, as the last entry
+                # returned by get_wal_possible_paths() is the archive position
+                if not os.path.exists(wal_file):
+                    pass
+                else:
+                    raise
+            except OSError as exc:
+                # If the WAL file disappeared just ignore the error
+                # This file will be retrieved later, as the last entry
+                # returned by get_wal_possible_paths() is the archive
+                # position
+                if exc.errno == errno.ENOENT and exc.filename == wal_file:
+                    pass
+                else:
+                    raise
+
+            logger.info("Skipping vanished WAL file '%s'%s",
+                        wal_file, source_suffix)
+
+        output.error("WAL file '%s' not found in server '%s'%s",
+                     wal_name, self.config.name, source_suffix)
+
+    def get_wal_sendfile(self, wal_file, compression, destination):
+        """
+        Send a WAL file to the destination file, using the required compression
+
+        :param str wal_file: WAL file path
+        :param str compression: required compression
+        :param destination: file stream to use to write the data
+        """
+        # Identify the wal file
+        wal_info = self.backup_manager.compression_manager \
+            .get_wal_file_info(wal_file)
+
+        # Get a decompressor for the file (None if not compressed)
+        wal_compressor = self.backup_manager.compression_manager \
+            .get_compressor(wal_info.compression)
+
+        # Get a compressor for the output (None if not compressed)
+        out_compressor = self.backup_manager.compression_manager \
+            .get_compressor(compression)
+
+        # Initially our source is the stored WAL file and we do not have
+        # any temporary file
+        source_file = wal_file
+        uncompressed_file = None
+        compressed_file = None
+
+        # If the required compression is different from the source we
+        # decompress/compress it into the required format (getattr is
+        # used here to gracefully handle None objects)
+        if getattr(wal_compressor, 'compression', None) != \
+                getattr(out_compressor, 'compression', None):
+            # If source is compressed, decompress it into a temporary file
+            if wal_compressor is not None:
+                uncompressed_file = NamedTemporaryFile(
+                    dir=self.config.wals_directory,
+                    prefix='.%s.' % os.path.basename(wal_file),
+                    suffix='.uncompressed')
+                # decompress wal file
+                wal_compressor.decompress(source_file, uncompressed_file.name)
+                source_file = uncompressed_file.name
+
+            # If output compression is required compress the source
+            # into a temporary file
+            if out_compressor is not None:
+                compressed_file = NamedTemporaryFile(
+                    dir=self.config.wals_directory,
+                    prefix='.%s.' % os.path.basename(wal_file),
+                    suffix='.compressed')
+                out_compressor.compress(source_file, compressed_file.name)
+                source_file = compressed_file.name
+
+        # Copy the prepared source file to destination
+        with open(source_file, 'rb') as input_file:
+            shutil.copyfileobj(input_file, destination)
+
+        # Remove temp files
+        if uncompressed_file is not None:
+            uncompressed_file.close()
+        if compressed_file is not None:
+            compressed_file.close()
+
+    def put_wal(self, fileobj):
+        """
+        Receive a WAL file from SERVER_NAME and securely store it in the
+        incoming directory.
+
+        The file will be read from the fileobj passed as parameter.
+        """
+
+        # If used through SSH identify the client to add it to logs
+        source_suffix = ''
+        ssh_connection = os.environ.get('SSH_CONNECTION')
+        if ssh_connection:
+            # The client IP is the first value contained in `SSH_CONNECTION`
+            # which contains four space-separated values: client IP address,
+            # client port number, server IP address, and server port number.
+            source_suffix = ' (SSH host: %s)' % (ssh_connection.split()[0],)
+
+        # Incoming directory is where the files will be extracted
+        dest_dir = self.config.incoming_wals_directory
+
+        # Ensure the presence of the destination directory
+        mkpath(dest_dir)
+
+        incoming_file = namedtuple('incoming_file', [
+            'name',
+            'tmp_path',
+            'path',
+            'checksum',
+        ])
+
+        # Stream read tar from stdin, store content in incoming directory
+        # The closing wrapper is needed only for Python 2.6
+        extracted_files = {}
+        validated_files = {}
+        md5sums = {}
+        try:
+            with closing(tarfile.open(mode='r|', fileobj=fileobj)) as tar:
+                for item in tar:
+                    name = item.name
+                    # Strip leading './' - tar has been manually created
+                    if name.startswith('./'):
+                        name = name[2:]
+                    # Requires a regular file as tar item
+                    if not item.isreg():
+                        output.error(
+                            "Unsupported file type '%s' for file '%s' "
+                            "in put-wal for server '%s'%s",
+                            item.type, name, self.config.name, source_suffix)
+                        return
+                    # Subdirectories are not supported
+                    if '/' in name:
+                        output.error(
+                            "Unsupported filename '%s' "
+                            "in put-wal for server '%s'%s",
+                            name, self.config.name, source_suffix)
+                        return
+                    # Checksum file
+                    if name == 'MD5SUMS':
+                        # Parse content and store it in md5sums dictionary
+                        for line in tar.extractfile(item).readlines():
+                            line = line.decode().rstrip()
+                            try:
+                                # Split checksums and path info
+                                checksum, path = re.split(
+                                    r' [* ]', line, 1)
+                            except ValueError:
+                                output.warning(
+                                    "Bad checksum line '%s' found "
+                                    "in put-wal for server '%s'%s",
+                                    line, self.config.name, source_suffix)
+                                continue
+                            # Strip leading './' from path in the checksum file
+                            if path.startswith('./'):
+                                path = path[2:]
+                            md5sums[path] = checksum
+                    else:
+                        # Extract using a temp name (with PID)
+                        tmp_path = os.path.join(dest_dir, '.%s-%s' % (
+                            os.getpid(), name))
+                        path = os.path.join(dest_dir, name)
+                        tar.makefile(item, tmp_path)
+                        # Set the original timestamp
+                        tar.utime(item, tmp_path)
+                        # Add the tuple to the dictionary of extracted files
+                        extracted_files[name] = incoming_file(
+                            name, tmp_path, path, file_md5(tmp_path))
+                        validated_files[name] = False
+
+            # For each received checksum verify the corresponding file
+            for name in md5sums:
+                # Check that file is present in the tar archive
+                if name not in extracted_files:
+                    output.error(
+                        "Checksum without corresponding file '%s' "
+                        "in put-wal for server '%s'%s",
+                        name, self.config.name, source_suffix)
+                    return
+                # Verify the checksum of the file
+                if extracted_files[name].checksum != md5sums[name]:
+                    output.error(
+                        "Bad file checksum '%s' (should be %s) "
+                        "for file '%s' "
+                        "in put-wal for server '%s'%s",
+                        extracted_files[name].checksum, md5sums[name],
+                        name, self.config.name, source_suffix)
+                    return
+                _logger.info(
+                    "Received file '%s' with checksum '%s' "
+                    "by put-wal for server '%s'%s",
+                    name, md5sums[name], self.config.name,
+                    source_suffix)
+                validated_files[name] = True
+
+            # Put the files in the final place, atomically and fsync all
+            for item in extracted_files.values():
+                # Final verification of checksum presence for each file
+                if not validated_files[item.name]:
+                    output.error(
+                        "Missing checksum for file '%s' "
+                        "in put-wal for server '%s'%s",
+                        item.name, self.config.name, source_suffix)
+                    return
+                # If a file with the same name exists, returns an error.
+                # PostgreSQL archive command will retry again later and,
+                # at that time, Frabit's WAL archiver should have already
+                # managed this file.
+                if os.path.exists(item.path):
+                    output.error(
+                        "Impossible to write already existing file '%s' "
+                        "in put-wal for server '%s'%s",
+                        item.name, self.config.name, source_suffix)
+                    return
+                os.rename(item.tmp_path, item.path)
+                fsync_file(item.path)
+            fsync_dir(dest_dir)
+        finally:
+            # Cleanup of any remaining temp files (where applicable)
+            for item in extracted_files.values():
+                if os.path.exists(item.tmp_path):
+                    os.unlink(item.tmp_path)
+
+    def cron(self, wals=True, retention_policies=True, keep_descriptors=False):
+        """
+        Maintenance operations
+
+        :param bool wals: WAL archive maintenance
+        :param bool retention_policies: retention policy maintenance
+        :param bool keep_descriptors: whether to keep subprocess descriptors,
+            defaults to False
+        """
+        try:
+            # Actually this is the highest level of locking in the cron,
+            # this stops the execution of multiple cron on the same server
+            with ServerCronLock(self.config.frabit_lock_directory,
+                                self.config.name):
+                # When passive call sync.cron() and never run
+                # local WAL archival
+                if self.replica_node:
+                    self.sync_cron(keep_descriptors)
+                # WAL management and maintenance
+                elif wals:
+                    # Execute the archive-wal sub-process
+                    self.cron_archive_wal(keep_descriptors)
+                    if self.config.streaming_archiver:
+                        # Spawn the receive-wal sub-process
+                        self.cron_receive_wal(keep_descriptors)
+                    else:
+                        # Terminate the receive-wal sub-process if present
+                        self.kill('receive-wal', fail_if_not_present=False)
+
+                # Verify backup
+                self.cron_check_backup(keep_descriptors)
+
+                # Retention policies execution
+                if retention_policies:
+                    self.backup_manager.cron_retention_policy()
+        except LockFileBusy:
+            output.info(
+                "Another cron process is already running on server %s. "
+                "Skipping to the next server" % self.config.name)
+        except LockFilePermissionDenied as e:
+            output.error("Permission denied, unable to access '%s'" % e)
+        except (OSError, IOError) as e:
+            output.error("%s", e)
+
+    def cron_archive_wal(self, keep_descriptors):
+        """
+        Method that handles the start of an 'archive-wal' sub-process.
+
+        This method must be run protected by ServerCronLock
+        :param bool keep_descriptors: whether to keep subprocess descriptors
+            attached to this process.
+        """
+        try:
+            # Try to acquire ServerWalArchiveLock, if the lock is available,
+            # no other 'archive-wal' processes are running on this server.
+            #
+            # There is a very little race condition window here because
+            # even if we are protected by ServerCronLock, the user could run
+            # another 'archive-wal' command manually. However, it would result
+            # in one of the two commands failing on lock acquisition,
+            # with no other consequence.
+            with ServerWalArchiveLock(
+                    self.config.frabit_lock_directory,
+                    self.config.name):
+                # Output and release the lock immediately
+                output.info("Starting WAL archiving for server %s",
+                            self.config.name, log=False)
+
+            # Init a Frabit sub-process object
+            archive_process = FrabitSubProcess(
+                subcommand='archive-wal',
+                config=frabit.__config__.config_file,
+                args=[self.config.name],
+                keep_descriptors=keep_descriptors)
+            # Launch the sub-process
+            archive_process.execute()
+
+        except LockFileBusy:
+            # Another archive process is running for the server,
+            # warn the user and skip to the next one.
+            output.info(
+                "Another archive-wal process is already running "
+                "on server %s. Skipping to the next server"
+                % self.config.name)
+
+    def cron_receive_wal(self, keep_descriptors):
+        """
+        Method that handles the start of a 'receive-wal' sub process
+
+        This method must be run protected by ServerCronLock
+        :param bool keep_descriptors: whether to keep subprocess
+           descriptors attached to this process.
+        """
+        try:
+            # Try to acquire ServerWalReceiveLock, if the lock is available,
+            # no other 'receive-wal' processes are running on this server.
+            #
+            # There is a very little race condition window here because
+            # even if we are protected by ServerCronLock, the user could run
+            # another 'receive-wal' command manually. However, it would result
+            # in one of the two commands failing on lock acquisition,
+            # with no other consequence.
+            with ServerWalReceiveLock(
+                    self.config.frabit_lock_directory,
+                    self.config.name):
+                # Output and release the lock immediately
+                output.info("Starting streaming archiver "
+                            "for server %s",
+                            self.config.name, log=False)
+
+            # Start a new receive-wal process
+            receive_process = FrabitSubProcess(
+                subcommand='receive-wal',
+                config=frabit.__config__.config_file,
+                args=[self.config.name],
+                keep_descriptors=keep_descriptors)
+            # Launch the sub-process
+            receive_process.execute()
+
+        except LockFileBusy:
+            # Another receive-wal process is running for the server
+            # exit without message
+            _logger.debug("Another STREAMING ARCHIVER process is running for "
+                          "server %s" % self.config.name)
+
+    def cron_check_backup(self, keep_descriptors):
+        """
+        Method that handles the start of a 'check-backup' sub process
+
+        :param bool keep_descriptors: whether to keep subprocess
+           descriptors attached to this process.
+        """
+
+        backup_id = self.get_first_backup_id([BackupInfo.WAITING_FOR_WALS])
+        if not backup_id:
+            # Nothing to be done for this server
+            return
+
+        try:
+            # Try to acquire ServerBackupIdLock, if the lock is available,
+            # no other 'check-backup' processes are running on this backup.
+            #
+            # There is a very little race condition window here because
+            # even if we are protected by ServerCronLock, the user could run
+            # another command that takes the lock. However, it would result
+            # in one of the two commands failing on lock acquisition,
+            # with no other consequence.
+            with ServerBackupIdLock(
+                    self.config.frabit_lock_directory,
+                    self.config.name,
+                    backup_id):
+                # Output and release the lock immediately
+                output.info("Starting check-backup for backup %s of server %s",
+                            backup_id, self.config.name, log=False)
+
+            # Start a check-backup process
+            check_process = FrabitSubProcess(
+                subcommand='check-backup',
+                config=frabit.__config__.config_file,
+                args=[self.config.name, backup_id],
+                keep_descriptors=keep_descriptors)
+            check_process.execute()
+
+        except LockFileBusy:
+            # Another process is holding the backup lock
+            _logger.debug("Another process is holding the backup lock for %s "
+                          "of server %s" % (backup_id, self.config.name))
+
+    def archive_wal(self, verbose=True):
+        """
+        Perform the WAL archiving operations.
+
+        Usually run as subprocess of the frabit cron command,
+        but can be executed manually using the frabit archive-wal command
+
+        :param bool verbose: if false outputs something only if there is
+            at least one file
+        """
+        output.debug("Starting archive-wal for server %s", self.config.name)
+        try:
+            # Take care of the archive lock.
+            # Only one archive job per server is admitted
+            with ServerWalArchiveLock(self.config.frabit_lock_directory,
+                                      self.config.name):
+                self.backup_manager.archive_wal(verbose)
+        except LockFileBusy:
+            # If another process is running for this server,
+            # warn the user and skip to the next server
+            output.info("Another archive-wal process is already running "
+                        "on server %s. Skipping to the next server"
+                        % self.config.name)
+
+    def receive_wal(self, reset=False):
+        """
+        Enable the reception of WAL files using streaming protocol.
+
+        Usually started by frabit cron command.
+        Executing this manually, the frabit process will not terminate but
+        will continuously receive WAL files from the PostgreSQL server.
+
+        :param reset: When set, resets the status of receive-wal
+        """
+        # Execute the receive-wal command only if streaming_archiver
+        # is enabled
+        if not self.config.streaming_archiver:
+            output.error("Unable to start receive-wal process: "
+                         "streaming_archiver option set to 'off' in "
+                         "frabit configuration file")
+            return
+
+        if not reset:
+            output.info("Starting receive-wal for server %s", self.config.name)
+
+        try:
+            # Take care of the receive-wal lock.
+            # Only one receiving process per server is permitted
+            with ServerWalReceiveLock(self.config.frabit_lock_directory,
+                                      self.config.name):
+                try:
+                    # Only the StreamingWalArchiver implementation
+                    # does something.
+                    # WARNING: This codes assumes that there is only one
+                    # StreamingWalArchiver in the archivers list.
+                    for archiver in self.archivers:
+                        archiver.receive_wal(reset)
+                except ArchiverFailure as e:
+                    output.error(e)
+
+        except LockFileBusy:
+            # If another process is running for this server,
+            if reset:
+                output.info("Unable to reset the status of receive-wal "
+                            "for server %s. Process is still running"
+                            % self.config.name)
+            else:
+                output.info("Another receive-wal process is already running "
+                            "for server %s." % self.config.name)
+
+    @property
+    def systemid(self):
+        """
+        Get the system identifier, as returned by the PostgreSQL server
+        :return str: the system identifier
+        """
+        status = self.get_remote_status()
+        # Main PostgreSQL connection has higher priority
+        if status.get('postgres_systemid'):
+            return status.get('postgres_systemid')
+        # Fallback: streaming connection
+        return status.get('streaming_systemid')
+
+    def report_backups(self):
+        if not self.enforce_retention_policies:
+            return dict()
+        else:
+            return self.config.retention_policy.report()
+
+    def rebuild_xlogdb(self):
+        """
+        Rebuild the whole xlog database guessing it from the archive content.
+        """
+        return self.backup_manager.rebuild_xlogdb()
+
+    def get_backup_ext_info(self, backup_info):
+        """
+        Return a dictionary containing all available information about a backup
+
+        The result is equivalent to the sum of information from
+
+         * BackupInfo object
+         * the Server.get_wal_info() return value
+         * the context in the catalog (if available)
+         * the retention policy status
+
+        :param backup_info: the target backup
+        :rtype dict: all information about a backup
+        """
+        backup_ext_info = backup_info.to_dict()
+        if backup_info.status in BackupInfo.STATUS_COPY_DONE:
+            try:
+                previous_backup = self.backup_manager.get_previous_backup(
+                    backup_ext_info['backup_id'])
+                next_backup = self.backup_manager.get_next_backup(
+                    backup_ext_info['backup_id'])
+                if previous_backup:
+                    backup_ext_info[
+                        'previous_backup_id'] = previous_backup.backup_id
+                else:
+                    backup_ext_info['previous_backup_id'] = None
+                if next_backup:
+                    backup_ext_info['next_backup_id'] = next_backup.backup_id
+                else:
+                    backup_ext_info['next_backup_id'] = None
+            except UnknownBackupIdException:
+                # no next_backup_id and previous_backup_id items
+                # means "Not available"
+                pass
+            backup_ext_info.update(self.get_wal_info(backup_info))
+            if self.enforce_retention_policies:
+                policy = self.config.retention_policy
+                backup_ext_info['retention_policy_status'] = \
+                    policy.backup_status(backup_info.backup_id)
+            else:
+                backup_ext_info['retention_policy_status'] = None
+
+            # Check any child timeline exists
+            children_timelines = self.get_children_timelines(
+                backup_ext_info['timeline'],
+                forked_after=backup_info.end_xlog)
+
+            backup_ext_info['children_timelines'] = \
+                children_timelines
+
+        return backup_ext_info
+
+    def show_backup(self, backup_info):
+        """
+        Output all available information about a backup
+
+        :param backup_info: the target backup
+        """
+        try:
+            backup_ext_info = self.get_backup_ext_info(backup_info)
+            output.result('show_backup', backup_ext_info)
+        except BadXlogSegmentName as e:
+            output.error(
+                "invalid xlog segment name %r\n"
+                "HINT: Please run \"frabit rebuild-xlogdb %s\" "
+                "to solve this issue",
+                force_str(e), self.config.name)
+            output.close_and_exit()
+
+    @staticmethod
+    def _build_path(path_prefix=None):
+        """
+        If a path_prefix is provided build a string suitable to be used in
+        PATH environment variable by joining the path_prefix with the
+        current content of PATH environment variable.
+
+        If the `path_prefix` is None returns None.
+
+        :rtype: str|None
+        """
+        if not path_prefix:
+            return None
+        sys_path = os.environ.get('PATH')
+        return "%s%s%s" % (path_prefix, os.pathsep, sys_path)
+
+    def kill(self, task, fail_if_not_present=True):
+        """
+        Given the name of a frabit sub-task type,
+        attempts to stop all the processes
+
+        :param string task: The task we want to stop
+        :param bool fail_if_not_present: Display an error when the process
+            is not present (default: True)
+        """
+        process_list = self.process_manager.list(task)
+        for process in process_list:
+            if self.process_manager.kill(process):
+                output.info('Stopped process %s(%s)',
+                            process.task, process.pid)
+                return
+            else:
+                output.error('Cannot terminate process %s(%s)',
+                             process.task, process.pid)
+                return
+        if fail_if_not_present:
+            output.error('Termination of %s failed: '
+                         'no such process for server %s',
+                         task, self.config.name)
+
+    def switch_wal(self, force=False, archive=None, archive_timeout=None):
+        """
+        Execute the switch-wal command on the target server
+        """
+        closed_wal = None
+        try:
+            if force:
+                # If called with force, execute a checkpoint before the
+                # switch_wal command
+                _logger.info('Force a CHECKPOINT before pg_switch_wal()')
+                self.mysqld.checkpoint()
+
+            # Perform the switch_wal. expect a WAL name only if the switch
+            # has been successfully executed, False otherwise.
+            closed_wal = self.mysqld.switch_wal()
+            if closed_wal is None:
+                # Something went wrong during the execution of the
+                # pg_switch_wal command
+                output.error("Unable to perform pg_switch_wal "
+                             "for server '%s'." % self.config.name)
+                return
+
+            if closed_wal:
+                # The switch_wal command have been executed successfully
+                output.info(
+                    "The WAL file %s has been closed on server '%s'" %
+                    (closed_wal, self.config.name))
+            else:
+                # Is not necessary to perform a switch_wal
+                output.info("No switch required for server '%s'" %
+                            self.config.name)
+        except MysqlIsInRecovery:
+            output.info("No switch performed because server '%s' "
+                        "is a standby." % self.config.name)
+        except MysqlSuperuserRequired:
+            # Superuser rights are required to perform the switch_wal
+            output.error("Frabit switch-wal requires superuser rights")
+            return
+
+        # If the user has asked to wait for a WAL file to be archived,
+        # wait until a new WAL file has been found
+        # or the timeout has expired
+        if archive:
+            self.wait_for_wal(closed_wal, archive_timeout)
+
+    def wait_for_wal(self, wal_file=None, archive_timeout=None):
+        """
+        Wait for a WAL file to be archived on the server
+
+        :param str|None wal_file: Name of the WAL file, or None if we should
+          just wait for a new WAL file to be archived
+        :param int|None archive_timeout: Timeout in seconds
+        """
+        max_msg = ""
+        if archive_timeout:
+            max_msg = " (max: %s seconds)" % archive_timeout
+
+        initial_wals = dict()
+        if not wal_file:
+            wals = self.backup_manager.get_latest_archived_wals_info()
+            initial_wals = dict([(tli, wals[tli].name) for tli in wals])
+
+        if wal_file:
+            output.info(
+                "Waiting for the WAL file %s from server '%s'%s",
+                wal_file, self.config.name, max_msg)
+        else:
+            output.info(
+                "Waiting for a WAL file from server '%s' to be archived%s",
+                self.config.name, max_msg)
+
+        # Wait for a new file until end_time or forever if no archive_timeout
+        end_time = None
+        if archive_timeout:
+            end_time = time.time() + archive_timeout
+        while not end_time or time.time() < end_time:
+            self.archive_wal(verbose=False)
+
+            # Finish if the closed wal file is in the archive.
+            if wal_file:
+                if os.path.exists(self.get_wal_full_path(wal_file)):
+                    break
+            else:
+                # Check if any new file has been archived, on any timeline
+                wals = self.backup_manager.get_latest_archived_wals_info()
+                current_wals = dict([(tli, wals[tli].name) for tli in wals])
+
+                if current_wals != initial_wals:
+                    break
+
+            # sleep a bit before retrying
+            time.sleep(.1)
+        else:
+            if wal_file:
+                output.error("The WAL file %s has not been received "
+                             "in %s seconds",
+                             wal_file, archive_timeout)
+            else:
+                output.info(
+                    "A WAL file has not been received in %s seconds",
+                    archive_timeout)
+
+    def replication_status(self, target='all'):
+        """
+        Implements the 'replication-status' command.
+        """
+        if target == 'hot-standby':
+            client_type = MySQLConnection.STANDBY
+        elif target == 'wal-streamer':
+            client_type = MySQLConnection.WALSTREAMER
+        else:
+            client_type = MySQLConnection.ANY_STREAMING_CLIENT
+        try:
+            standby_info = self.mysqld.get_replication_stats(client_type)
+            if standby_info is None:
+                output.error('Unable to connect to server %s' %
+                             self.config.name)
+            else:
+                output.result('replication_status', self.config.name,
+                              target, self.mysqld.current_xlog_location,
+                              standby_info)
+        except MysqlUnsupportedFeature as e:
+            output.info("  Requires MySQL %s or higher", e)
+        except MysqlSuperuserRequired:
+            output.info("  Requires superuser rights")
+
+    def get_children_timelines(self, tli, forked_after=None):
+        """
+        Get a list of the children of the passed timeline
+
+        :param int tli: Id of the timeline to check
+        :param str forked_after: XLog location after which the timeline
+          must have been created
+        :return List[xlog.HistoryFileData]: the list of timelines that
+          have the timeline with id 'tli' as parent
+        """
+        comp_manager = self.backup_manager.compression_manager
+
+        if forked_after:
+            forked_after = xlog.parse_lsn(forked_after)
+
+        children = []
+        # Search all the history files after the passed timeline
+        children_tli = tli
+        while True:
+            children_tli += 1
+            history_path = os.path.join(self.config.wals_directory,
+                                        "%08X.history" % children_tli)
+            # If the file doesn't exists, stop searching
+            if not os.path.exists(history_path):
+                break
+
+            # Create the WalFileInfo object using the file
+            wal_info = comp_manager.get_wal_file_info(history_path)
+            # Get content of the file. We need to pass a compressor manager
+            # here to handle an eventual compression of the history file
+            history_info = xlog.decode_history_file(
+                wal_info,
+                self.backup_manager.compression_manager)
+
+            # Save the history only if is reachable from this timeline.
+            for tinfo in history_info:
+                # The history file contains the full genealogy
+                # but we keep only the line with `tli` timeline as parent.
+                if tinfo.parent_tli != tli:
+                    continue
+
+                # We need to return this history info only if this timeline
+                # has been forked after the passed LSN
+                if forked_after and tinfo.switchpoint < forked_after:
+                    continue
+
+                children.append(tinfo)
+
+        return children
+
+    def check_backup(self, backup_info):
+        """
+        Make sure that we have all the WAL files required
+        by a physical backup for consistency (from the
+        first to the last WAL file)
+
+        :param backup_info: the target backup
+        """
+        output.debug("Checking backup %s of server %s",
+                     backup_info.backup_id, self.config.name)
+        try:
+            # No need to check a backup which is not waiting for WALs.
+            # Doing that we could also mark as DONE backups which
+            # were previously FAILED due to copy errors
+            if backup_info.status == BackupInfo.FAILED:
+                output.error(
+                    "The validity of a failed backup cannot be checked")
+                return
+
+            # Take care of the backup lock.
+            # Only one process can modify a backup a a time
+            with ServerBackupIdLock(self.config.frabit_lock_directory,
+                                    self.config.name,
+                                    backup_info.backup_id):
+                orig_status = backup_info.status
+                self.backup_manager.check_backup(backup_info)
+                if orig_status == backup_info.status:
+                    output.debug(
+                        "Check finished: the status of backup %s of server %s "
+                        "remains %s",
+                        backup_info.backup_id,
+                        self.config.name,
+                        backup_info.status)
+                else:
+                    output.debug(
+                        "Check finished: the status of backup %s of server %s "
+                        "changed from %s to %s",
+                        backup_info.backup_id,
+                        self.config.name,
+                        orig_status,
+                        backup_info.status)
+        except LockFileBusy:
+            # If another process is holding the backup lock,
+            # notify the user and terminate.
+            # This is not an error condition because it happens when
+            # another process is validating the backup.
+            output.info(
+                "Another process is holding the lock for "
+                "backup %s of server %s." % (
+                    backup_info.backup_id, self.config.name))
+            return
+
+        except LockFilePermissionDenied as e:
+            # We cannot access the lockfile.
+            # warn the user and terminate
+            output.error("Permission denied, unable to access '%s'" % e)
+            return
+
+    def sync_status(self, last_wal=None, last_position=None):
+        """
+        Return server status for sync purposes.
+
+        The method outputs JSON, containing:
+         * list of backups (with DONE status)
+         * server configuration
+         * last read position (in xlog.db)
+         * last read wal
+         * list of archived wal files
+
+        If last_wal is provided, the method will discard all the wall files
+        older than last_wal.
+        If last_position is provided the method will try to read
+        the xlog.db file using last_position as starting point.
+        If the wal file at last_position does not match last_wal, read from the
+        start and use last_wal as limit
+
+        :param str|None last_wal: last read wal
+        :param int|None last_position: last read position (in xlog.db)
+        """
+        sync_status = {}
+        wals = []
+        # Get all the backups using default filter for
+        # get_available_backups method
+        # (BackupInfo.DONE)
+        backups = self.get_available_backups()
+        # Retrieve the first wal associated to a backup, it will be useful
+        # to filter our eventual WAL too old to be useful
+        first_useful_wal = None
+        if backups:
+            first_useful_wal = backups[sorted(backups.keys())[0]].begin_wal
+        # Read xlogdb file.
+        with self.xlogdb() as fxlogdb:
+            starting_point = self.set_sync_starting_point(fxlogdb,
+                                                          last_wal,
+                                                          last_position)
+            check_first_wal = starting_point == 0 and last_wal is not None
+            # The wal_info and line variables are used after the loop.
+            # We initialize them here to avoid errors with an empty xlogdb.
+            line = None
+            wal_info = None
+            for line in fxlogdb:
+                # Parse the line
+                wal_info = WalFileInfo.from_binlog_line(line)
+                # Check if user is requesting data that is not available.
+                # TODO: probably the check should be something like
+                # TODO: last_wal + 1 < wal_info.name
+                if check_first_wal:
+                    if last_wal < wal_info.name:
+                        raise SyncError(
+                            "last_wal '%s' is older than the first"
+                            " available wal '%s'" % (last_wal, wal_info.name))
+                    else:
+                        check_first_wal = False
+                # If last_wal is provided, discard any line older than last_wal
+                if last_wal:
+                    if wal_info.name <= last_wal:
+                        continue
+                # Else don't return any WAL older than first available backup
+                elif first_useful_wal and wal_info.name < first_useful_wal:
+                    continue
+                wals.append(wal_info)
+            if wal_info is not None:
+                # Check if user is requesting data that is not available.
+                if last_wal is not None and last_wal > wal_info.name:
+                    raise SyncError(
+                        "last_wal '%s' is newer than the last available wal "
+                        " '%s'" % (last_wal, wal_info.name))
+                # Set last_position with the current position - len(last_line)
+                # (returning the beginning of the last line)
+                sync_status['last_position'] = fxlogdb.tell() - len(line)
+                # Set the name of the last wal of the file
+                sync_status['last_name'] = wal_info.name
+            else:
+                # we started over
+                sync_status['last_position'] = 0
+                sync_status['last_name'] = ''
+            sync_status['backups'] = backups
+            sync_status['wals'] = wals
+            sync_status['version'] = frabit.__version__
+            sync_status['config'] = self.config
+        json.dump(sync_status, sys.stdout, cls=FrabitEncoder, indent=4)
+
+    def sync_cron(self, keep_descriptors):
+        """
+        Manage synchronisation operations between passive node and
+        master node.
+        The method recover information from the remote master
+        server, evaluate if synchronisation with the master is required
+        and spawn frabit sub processes, syncing backups and WAL files
+        :param bool keep_descriptors: whether to keep subprocess descriptors
+           attached to this process.
+        """
+        # Recover information from primary node
+        sync_wal_info = self.load_sync_wals_info()
+        # Use last_wal and last_position for the remote call to the
+        # master server
+        try:
+            remote_info = self.primary_node_info(sync_wal_info.last_wal,
+                                                 sync_wal_info.last_position)
+        except SyncError as exc:
+            output.error("Failed to retrieve the primary node status: %s"
+                         % force_str(exc))
+            return
+
+        # Perform backup synchronisation
+        if remote_info['backups']:
+            # Get the list of backups that need to be synced
+            # with the local server
+            local_backup_list = self.get_available_backups()
+            # Subtract the list of the already
+            # synchronised backups from the remote backup lists,
+            # obtaining the list of backups still requiring synchronisation
+            sync_backup_list = set(remote_info['backups']) - set(
+                local_backup_list)
+        else:
+            # No backup to synchronisation required
+            output.info("No backup synchronisation required for server %s",
+                        self.config.name, log=False)
+            sync_backup_list = []
+        for backup_id in sorted(sync_backup_list):
+            # Check if this backup_id needs to be synchronized by spawning a
+            # sync-backup process.
+            # The same set of checks will be executed by the spawned process.
+            # This "double check" is necessary because we don't want the cron
+            # to spawn unnecessary processes.
+            try:
+                local_backup_info = self.get_backup(backup_id)
+                self.check_sync_required(backup_id,
+                                         remote_info,
+                                         local_backup_info)
+            except SyncError as e:
+                # It means that neither the local backup
+                # nor the remote one exist.
+                # This should not happen here.
+                output.exception("Unexpected state: %s", e)
+                break
+            except SyncToBeDeleted:
+                # The backup does not exist on primary server
+                # and is FAILED here.
+                # It must be removed by the sync-backup process.
+                pass
+            except SyncNothingToDo:
+                # It could mean that the local backup is in DONE state or
+                # that it is obsolete according to
+                # the local retention policies.
+                # In both cases, continue with the next backup.
+                continue
+            # Now that we are sure that a backup-sync subprocess is necessary,
+            # we need to acquire the backup lock, to be sure that
+            # there aren't other processes synchronising the backup.
+            # If cannot acquire the lock, another synchronisation process
+            # is running, so we give up.
+            try:
+                with ServerBackupSyncLock(self.config.frabit_lock_directory,
+                                          self.config.name, backup_id):
+                    output.info("Starting copy of backup %s for server %s",
+                                backup_id, self.config.name)
+            except LockFileBusy:
+                output.info("A synchronisation process for backup %s"
+                            " on server %s is already in progress",
+                            backup_id, self.config.name, log=False)
+                # Stop processing this server
+                break
+
+            # Init a Frabit sub-process object
+            sub_process = FrabitSubProcess(
+                subcommand='sync-backup',
+                config=frabit.__config__.config_file,
+                args=[self.config.name, backup_id],
+                keep_descriptors=keep_descriptors)
+            # Launch the sub-process
+            sub_process.execute()
+
+            # Stop processing this server
+            break
+
+        # Perform WAL synchronisation
+        if remote_info['wals']:
+            # We need to acquire a sync-wal lock, to be sure that
+            # there aren't other processes synchronising the WAL files.
+            # If cannot acquire the lock, another synchronisation process
+            # is running, so we give up.
+            try:
+                with ServerBinlogSyncLock(self.config.frabit_lock_directory,
+                                          self.config.name, ):
+                    output.info("Started copy of WAL files for server %s",
+                                self.config.name)
+            except LockFileBusy:
+                output.info("WAL synchronisation already running"
+                            " for server %s", self.config.name, log=False)
+                return
+
+            # Init a Frabit sub-process object
+            sub_process = FrabitSubProcess(
+                subcommand='sync-wals',
+                config=frabit.__config__.config_file,
+                args=[self.config.name],
+                keep_descriptors=keep_descriptors)
+            # Launch the sub-process
+            sub_process.execute()
+        else:
+            # no WAL synchronisation is required
+            output.info("No WAL synchronisation required for server %s",
+                        self.config.name, log=False)
+
+    def check_sync_required(self,
+                            backup_name,
+                            primary_info,
+                            local_backup_info):
+        """
+        Check if it is necessary to sync a backup.
+
+        If the backup is present on the Primary node:
+
+        * if it does not exist locally: continue (synchronise it)
+        * if it exists and is DONE locally: raise SyncNothingToDo
+          (nothing to do)
+        * if it exists and is FAILED locally: continue (try to recover it)
+
+        If the backup is not present on the Primary node:
+
+        * if it does not exist locally: raise SyncError (wrong call)
+        * if it exists and is DONE locally: raise SyncNothingToDo
+          (nothing to do)
+        * if it exists and is FAILED locally: raise SyncToBeDeleted (remove it)
+
+        If a backup needs to be synchronised but it is obsolete according
+        to local retention policies, raise SyncNothingToDo,
+        else return to the caller.
+
+        :param str backup_name: str name of the backup to sync
+        :param dict primary_info: dict containing the Primary node status
+        :param frabit.info.BackupInfo local_backup_info: BackupInfo object
+                representing the current backup state
+
+        :raise SyncError: There is an error in the user request
+        :raise SyncNothingToDo: Nothing to do for this request
+        :raise SyncToBeDeleted: Backup is not recoverable and must be deleted
+        """
+        backups = primary_info['backups']
+        # Backup not present on Primary node, and not present
+        # locally. Raise exception.
+        if backup_name not in backups \
+                and local_backup_info is None:
+            raise SyncError("Backup %s is absent on %s server" %
+                            (backup_name, self.config.name))
+        # Backup not present on Primary node, but is
+        # present locally with status FAILED: backup incomplete.
+        # Remove the backup and warn the user
+        if backup_name not in backups \
+                and local_backup_info is not None \
+                and local_backup_info.status == BackupInfo.FAILED:
+            raise SyncToBeDeleted(
+                "Backup %s is absent on %s server and is incomplete locally" %
+                (backup_name, self.config.name))
+
+        # Backup not present on Primary node, but is
+        # present locally with status DONE. Sync complete, local only.
+        if backup_name not in backups \
+                and local_backup_info is not None \
+                and local_backup_info.status == BackupInfo.DONE:
+            raise SyncNothingToDo(
+                "Backup %s is absent on %s server, but present locally "
+                "(local copy only)" % (backup_name, self.config.name))
+
+        # Backup present on Primary node, and present locally
+        # with status DONE. Sync complete.
+        if backup_name in backups \
+                and local_backup_info is not None \
+                and local_backup_info.status == BackupInfo.DONE:
+            raise SyncNothingToDo("Backup %s is already synced with"
+                                  " %s server" % (backup_name,
+                                                  self.config.name))
+
+        # Retention Policy: if the local server has a Retention policy,
+        # check that the remote backup is not obsolete.
+        enforce_retention_policies = self.enforce_retention_policies
+        retention_policy_mode = self.config.retention_policy_mode
+        if enforce_retention_policies and retention_policy_mode == 'auto':
+            # All the checks regarding retention policies are in
+            # this boolean method.
+            if self.is_backup_locally_obsolete(backup_name, backups):
+                # The remote backup is obsolete according to
+                # local retention policies.
+                # Nothing to do.
+                raise SyncNothingToDo("Remote backup %s/%s is obsolete for "
+                                      "local retention policies." %
+                                      (primary_info['config']['name'],
+                                       backup_name))
+
+    def load_sync_wals_info(self):
+        """
+        Load the content of SYNC_WALS_INFO_FILE for the given server
+
+        :return collections.namedtuple: last read wal and position information
+        """
+        sync_wals_info_file = os.path.join(self.config.wals_directory,
+                                           SYNC_WALS_INFO_FILE)
+        if not os.path.exists(sync_wals_info_file):
+            return SyncWalInfo(None, None)
+        try:
+            with open(sync_wals_info_file) as f:
+                return SyncWalInfo._make(f.readline().split('\t'))
+        except (OSError, IOError) as e:
+            raise SyncError("Cannot open %s file for server %s: %s" % (
+                SYNC_WALS_INFO_FILE, self.config.name, e))
+
+    def primary_node_info(self, last_wal=None, last_position=None):
+        """
+        Invoke sync-info directly on the specified primary node
+
+        The method issues a call to the sync-info method on the primary
+        node through an SSH connection
+
+        :param frabit.server.Server self: the Server object
+        :param str|None last_wal: last read wal
+        :param int|None last_position: last read position (in xlog.db)
+        :raise SyncError: if the ssh command fails
+        """
+        # First we need to check if the server is in passive mode
+        _logger.debug("primary sync-info(%s, %s, %s)",
+                      self.config.name,
+                      last_wal,
+                      last_position)
+        if not self.replica_node:
+            raise SyncError("server %s is not passive" % self.config.name)
+        # Issue a call to 'frabit sync-info' to the primary node,
+        # using primary_ssh_command option to establish an
+        # SSH connection.
+        remote_command = Command(cmd=self.config.primary_ssh_command,
+                                 shell=True, check=True, path=self.path)
+        # We run it in a loop to retry when the master issues error.
+        while True:
+            try:
+                # Build the command string
+                cmd_str = "frabit sync-info %s " % self.config.name
+                # If necessary we add last_wal and last_position
+                # to the command string
+                if last_wal is not None:
+                    cmd_str += "%s " % last_wal
+                    if last_position is not None:
+                        cmd_str += "%s " % last_position
+                # Then issue the command
+                remote_command(cmd_str)
+                # All good, exit the retry loop with 'break'
+                break
+            except CommandFailedException as exc:
+                # In case we requested synchronisation with a last WAL info,
+                # we try again requesting the full current status, but only if
+                # exit code is 1. A different exit code means that
+                # the error is not from Frabit (i.e. ssh failure)
+                if exc.args[0]['ret'] == 1 and last_wal is not None:
+                    last_wal = None
+                    last_position = None
+                    output.warning(
+                        "sync-info is out of sync. "
+                        "Self-recovery procedure started: "
+                        "requesting full synchronisation from "
+                        "primary server %s" % self.config.name)
+                    continue
+                # Wrap the CommandFailed exception with a SyncError
+                # for custom message and logging.
+                raise SyncError("sync-info execution on remote "
+                                "primary server %s failed: %s" %
+                                (self.config.name, exc.args[0]['err']))
+
+        # Save the result on disk
+        primary_info_file = os.path.join(self.config.backup_directory,
+                                         PRIMARY_INFO_FILE)
+
+        # parse the json output
+        remote_info = json.loads(remote_command.out)
+
+        try:
+            # TODO: rename the method to make it public
+            # noinspection PyProtectedMember
+            self._make_directories()
+            # Save remote info to disk
+            # We do not use a LockFile here. Instead we write all data
+            # in a new file (adding '.tmp' extension) then we rename it
+            # replacing the old one.
+            # It works while the renaming is an atomic operation
+            # (this is a POSIX requirement)
+            primary_info_file_tmp = primary_info_file + '.tmp'
+            with open(primary_info_file_tmp, 'w') as info_file:
+                info_file.write(remote_command.out)
+            os.rename(primary_info_file_tmp, primary_info_file)
+        except (OSError, IOError) as e:
+            # Wrap file access exceptions using SyncError
+            raise SyncError("Cannot open %s file for server %s: %s" % (
+                PRIMARY_INFO_FILE,
+                self.config.name, e))
+
+        return remote_info
+
+    def is_backup_locally_obsolete(self, backup_name, remote_backups):
+        """
+        Check if a remote backup is obsolete according with the local
+        retention policies.
+
+        :param frabit.server.Server self: Server object
+        :param str backup_name: str name of the backup to sync
+        :param dict remote_backups: dict containing the Primary node status
+
+        :return bool: returns if the backup is obsolete or not
+        """
+        # Get the local backups and add the remote backup info. This will
+        # simulate the situation after the copy of the remote backup.
+        local_backups = self.get_available_backups(BackupInfo.STATUS_NOT_EMPTY)
+        backup = remote_backups[backup_name]
+        local_backups[backup_name] = LocalBackupInfo.from_json(self, backup)
+        # Execute the local retention policy on the modified list of backups
+        report = self.config.retention_policy.report(source=local_backups)
+        # If the added backup is obsolete return true.
+        return report[backup_name] == BackupInfo.OBSOLETE
+
+    def sync_backup(self, backup_name):
+        """
+        Method for the synchronisation of a backup from a primary server.
+
+        The Method checks that the server is passive, then if it is possible to
+        sync with the Primary. Acquires a lock at backup level
+        and copy the backup from the Primary node using rsync.
+
+        During the sync process the backup on the Passive node
+        is marked as SYNCING and if the sync fails
+        (due to network failure, user interruption...) it is marked as FAILED.
+
+        :param frabit.server.Server self: the passive Server object to sync
+        :param str backup_name: the name of the backup to sync.
+        """
+
+        _logger.debug("sync_backup(%s, %s)", self.config.name, backup_name)
+        if not self.replica_node:
+            raise SyncError("server %s is not passive" % self.config.name)
+
+        local_backup_info = self.get_backup(backup_name)
+        # Step 1. Parse data from Primary server.
+        _logger.info(
+            "Synchronising with server %s backup %s: step 1/3: "
+            "parse server information", self.config.name, backup_name)
+        try:
+            primary_info = self.load_primary_info()
+            self.check_sync_required(backup_name,
+                                     primary_info, local_backup_info)
+        except SyncError as e:
+            # Invocation error: exit with return code 1
+            output.error("%s", e)
+            return
+        except SyncToBeDeleted as e:
+            # The required backup does not exist on primary,
+            # therefore it should be deleted also on passive node,
+            # as it's not in DONE status.
+            output.warning("%s, purging local backup", e)
+            self.delete_backup(local_backup_info)
+            return
+        except SyncNothingToDo as e:
+            # Nothing to do. Log as info level and exit
+            output.info("%s", e)
+            return
+        # If the backup is present on Primary node, and is not present at all
+        # locally or is present with FAILED status, execute sync.
+        # Retrieve info about the backup from PRIMARY_INFO_FILE
+        remote_backup_info = primary_info['backups'][backup_name]
+        remote_backup_dir = primary_info['config']['basebackups_directory']
+
+        # Try to acquire the backup lock, if the lock is not available abort
+        # the copy.
+        try:
+            with ServerBackupSyncLock(self.config.frabit_lock_directory,
+                                      self.config.name, backup_name):
+                try:
+                    backup_manager = self.backup_manager
+
+                    # Build a BackupInfo object
+                    local_backup_info = LocalBackupInfo.from_json(
+                        self,
+                        remote_backup_info)
+                    local_backup_info.set_attribute('status',
+                                                    BackupInfo.SYNCING)
+                    local_backup_info.save()
+                    backup_manager.backup_cache_add(local_backup_info)
+
+                    # Activate incremental copy if requested
+                    # Calculate the safe_horizon as the start time of the older
+                    # backup involved in the copy
+                    # NOTE: safe_horizon is a tz-aware timestamp because
+                    # BackupInfo class ensures that property
+                    reuse_mode = self.config.reuse_backup
+                    safe_horizon = None
+                    reuse_dir = None
+                    if reuse_mode:
+                        prev_backup = backup_manager.get_previous_backup(
+                            backup_name)
+                        next_backup = backup_manager.get_next_backup(
+                            backup_name)
+                        # If a newer backup is present, using it is preferable
+                        # because that backup will remain valid longer
+                        if next_backup:
+                            safe_horizon = local_backup_info.begin_time
+                            reuse_dir = next_backup.get_basebackup_directory()
+                        elif prev_backup:
+                            safe_horizon = prev_backup.begin_time
+                            reuse_dir = prev_backup.get_basebackup_directory()
+                        else:
+                            reuse_mode = None
+
+                    # Try to copy from the Primary node the backup using
+                    # the copy controller.
+                    copy_controller = RsyncCopyController(
+                        ssh_command=self.config.primary_ssh_command,
+                        network_compression=self.config.network_compression,
+                        path=self.path,
+                        reuse_backup=reuse_mode,
+                        safe_horizon=safe_horizon,
+                        retry_times=self.config.basebackup_retry_times,
+                        retry_sleep=self.config.basebackup_retry_sleep,
+                        workers=self.config.parallel_jobs)
+                    copy_controller.add_directory(
+                        'basebackup',
+                        ":%s/%s/" % (remote_backup_dir, backup_name),
+                        local_backup_info.get_basebackup_directory(),
+                        exclude_and_protect=['/backup.info', '/.backup.lock'],
+                        bwlimit=self.config.bandwidth_limit,
+                        reuse=reuse_dir,
+                        item_class=RsyncCopyController.PGDATA_CLASS)
+                    _logger.info(
+                        "Synchronising with server %s backup %s: step 2/3: "
+                        "file copy", self.config.name, backup_name)
+                    copy_controller.copy()
+
+                    # Save the backup state and exit
+                    _logger.info("Synchronising with server %s backup %s: "
+                                 "step 3/3: finalise sync",
+                                 self.config.name, backup_name)
+                    local_backup_info.set_attribute('status', BackupInfo.DONE)
+                    local_backup_info.save()
+                except CommandFailedException as e:
+                    # Report rsync errors
+                    msg = 'failure syncing server %s backup %s: %s' % (
+                        self.config.name, backup_name, e)
+                    output.error(msg)
+                    # Set the BackupInfo status to FAILED
+                    local_backup_info.set_attribute('status',
+                                                    BackupInfo.FAILED)
+                    local_backup_info.set_attribute('error', msg)
+                    local_backup_info.save()
+                    return
+                # Catch KeyboardInterrupt (Ctrl+c) and all the exceptions
+                except BaseException as e:
+                    msg_lines = force_str(e).strip().splitlines()
+                    if local_backup_info:
+                        # Use only the first line of exception message
+                        # in local_backup_info error field
+                        local_backup_info.set_attribute("status",
+                                                        BackupInfo.FAILED)
+                        # If the exception has no attached message
+                        # use the raw type name
+                        if not msg_lines:
+                            msg_lines = [type(e).__name__]
+                        local_backup_info.set_attribute(
+                            "error",
+                            "failure syncing server %s backup %s: %s" % (
+                                self.config.name, backup_name, msg_lines[0]))
+                        local_backup_info.save()
+                    output.error("Backup failed syncing with %s: %s\n%s",
+                                 self.config.name, msg_lines[0],
+                                 '\n'.join(msg_lines[1:]))
+        except LockFileException:
+            output.error("Another synchronisation process for backup %s "
+                         "of server %s is already running.",
+                         backup_name, self.config.name)
+
+    def sync_wals(self):
+        """
+        Method for the synchronisation of WAL files on the passive node,
+        by copying them from the primary server.
+
+        The method checks if the server is passive, then tries to acquire
+        a sync-wal lock.
+
+        Recovers the id of the last locally archived WAL file from the
+        status file ($wals_directory/sync-wals.info).
+
+        Reads the primary.info file and parses it, then obtains the list of
+        WAL files that have not yet been synchronised with the master.
+        Rsync is used for file synchronisation with the primary server.
+
+        Once the copy is finished, acquires a lock on xlog.db, updates it
+        then releases the lock.
+
+        Before exiting, the method updates the last_wal
+        and last_position fields in the sync-wals.info file.
+
+        :param frabit.server.Server self: the Server object to synchronise
+        """
+        _logger.debug("sync_wals(%s)", self.config.name)
+        if not self.replica_node:
+            raise SyncError("server %s is not passive" % self.config.name)
+
+        # Try to acquire the sync-wal lock if the lock is not available,
+        # abort the sync-wal operation
+        try:
+            with ServerBinlogSyncLock(self.config.frabit_lock_directory,
+                                      self.config.name, ):
+                try:
+                    # Need to load data from status files: primary.info
+                    # and sync-wals.info
+                    sync_wals_info = self.load_sync_wals_info()
+                    primary_info = self.load_primary_info()
+                    # We want to exit if the compression on master is different
+                    # from the one on the local server
+                    if primary_info['config']['compression'] \
+                            != self.config.compression:
+                        raise SyncError("Compression method on server %s "
+                                        "(%s) does not match local "
+                                        "compression method (%s) " %
+                                        (self.config.name,
+                                         primary_info['config']['compression'],
+                                         self.config.compression))
+                    # If the first WAL that needs to be copied is older
+                    # than the begin WAL of the first locally available backup,
+                    # synchronisation is skipped. This means that we need
+                    # to copy a WAL file which won't be associated to any local
+                    # backup. Consider the following scenarios:
+                    #
+                    # bw: indicates the begin WAL of the first backup
+                    # sw: the first WAL to be sync-ed
+                    #
+                    # The following examples use truncated names for WAL files
+                    # (e.g. 1 instead of 000000010000000000000001)
+                    #
+                    # Case 1: bw = 10, sw = 9 - SKIP and wait for backup
+                    # Case 2: bw = 10, sw = 10 - SYNC
+                    # Case 3: bw = 10, sw = 15 - SYNC
+                    #
+                    # Search for the first WAL file (skip history,
+                    # backup and partial files)
+                    first_remote_wal = None
+                    for wal in primary_info['wals']:
+                        if xlog.is_wal_file(wal['name']):
+                            first_remote_wal = wal['name']
+                            break
+
+                    first_backup_id = self.get_first_backup_id()
+                    first_backup = self.get_backup(first_backup_id) \
+                        if first_backup_id else None
+                    # Also if there are not any backups on the local server
+                    # no wal synchronisation is required
+                    if not first_backup:
+                        output.warning("No base backup for server %s"
+                                       % self.config.name)
+                        return
+
+                    if first_backup.begin_wal > first_remote_wal:
+                        output.warning("Skipping WAL synchronisation for "
+                                       "server %s: no available local backup "
+                                       "for %s" % (self.config.name,
+                                                   first_remote_wal))
+                        return
+
+                    local_wals = []
+                    wal_file_paths = []
+                    for wal in primary_info['wals']:
+                        # filter all the WALs that are smaller
+                        # or equal to the name of the latest synchronised WAL
+                        if sync_wals_info.last_wal and \
+                                wal['name'] <= sync_wals_info.last_wal:
+                            continue
+                        # Generate WalFileInfo Objects using remote WAL metas.
+                        # This list will be used for the update of the xlog.db
+                        wal_info_file = WalFileInfo(**wal)
+                        local_wals.append(wal_info_file)
+                        wal_file_paths.append(wal_info_file.relpath())
+
+                    # Rsync Options:
+                    # recursive: recursive copy of subdirectories
+                    # perms: preserve permissions on synced files
+                    # times: preserve modification timestamps during
+                    #   synchronisation
+                    # protect-args: force rsync to preserve the integrity of
+                    #   rsync command arguments and filename.
+                    # inplace: for inplace file substitution
+                    #   and update of files
+                    rsync = Rsync(
+                        args=['--recursive', '--perms', '--times',
+                              '--protect-args', '--inplace'],
+                        ssh=self.config.primary_ssh_command,
+                        bwlimit=self.config.bandwidth_limit,
+                        allowed_retval=(0,),
+                        network_compression=self.config.network_compression,
+                        path=self.path)
+                    # Source and destination of the rsync operations
+                    src = ':%s/' % primary_info['config']['wals_directory']
+                    dest = '%s/' % self.config.wals_directory
+
+                    # Perform the rsync copy using the list of relative paths
+                    # obtained from the primary.info file
+                    rsync.from_file_list(wal_file_paths, src, dest)
+
+                    # If everything is synced without errors,
+                    # update xlog.db using the list of WalFileInfo object
+                    with self.xlogdb('a') as fxlogdb:
+                        for wal_info in local_wals:
+                            fxlogdb.write(wal_info.to_binlog_line())
+                    # We need to update the sync-wals.info file with the latest
+                    # synchronised WAL and the latest read position.
+                    self.write_sync_wals_info_file(primary_info)
+
+                except CommandFailedException as e:
+                    msg = "WAL synchronisation for server %s " \
+                          "failed: %s" % (self.config.name, e)
+                    output.error(msg)
+                    return
+                except BaseException as e:
+                    msg_lines = force_str(e).strip().splitlines()
+                    # Use only the first line of exception message
+                    # If the exception has no attached message
+                    # use the raw type name
+                    if not msg_lines:
+                        msg_lines = [type(e).__name__]
+                    output.error("WAL synchronisation for server %s "
+                                 "failed with: %s\n%s",
+                                 self.config.name, msg_lines[0],
+                                 '\n'.join(msg_lines[1:]))
+        except LockFileException:
+            output.error("Another sync-wal operation is running "
+                         "for server %s ", self.config.name)
+
+    @staticmethod
+    def set_sync_starting_point(xlogdb_file, last_wal, last_position):
+        """
+        Check if the xlog.db file has changed between two requests
+        from the client and set the start point for reading the file
+
+        :param file xlogdb_file: an open and readable xlog.db file object
+        :param str|None last_wal: last read name
+        :param int|None last_position: last read position
+        :return int: the position has been set
+        """
+        # If last_position is None start reading from the beginning of the file
+        position = int(last_position) if last_position is not None else 0
+        # Seek to required position
+        xlogdb_file.seek(position)
+        # Read 24 char (the size of a wal name)
+        wal_name = xlogdb_file.read(24)
+        # If the WAL name is the requested one start from last_position
+        if wal_name == last_wal:
+            # Return to the line start
+            xlogdb_file.seek(position)
+            return position
+        # If the file has been truncated, start over
+        xlogdb_file.seek(0)
+        return 0
+
+    def write_sync_wals_info_file(self, primary_info):
+        """
+        Write the content of SYNC_WALS_INFO_FILE on disk
+
+        :param dict primary_info:
+        """
+        try:
+            with open(os.path.join(self.config.wals_directory,
+                                   SYNC_WALS_INFO_FILE), 'w') as syncfile:
+                syncfile.write("%s\t%s" % (primary_info['last_name'],
+                                           primary_info['last_position']))
+        except (OSError, IOError):
+            # Wrap file access exceptions using SyncError
+            raise SyncError("Unable to write %s file for server %s" %
+                            (SYNC_WALS_INFO_FILE, self.config.name))
+
+    def load_primary_info(self):
+        """
+        Load the content of PRIMARY_INFO_FILE for the given server
+
+        :return dict: primary server information
+        """
+        primary_info_file = os.path.join(self.config.backup_directory,
+                                         PRIMARY_INFO_FILE)
+        try:
+            with open(primary_info_file) as f:
+                return json.load(f)
+        except (OSError, IOError) as e:
+            # Wrap file access exceptions using SyncError
+            raise SyncError("Cannot open %s file for server %s: %s" % (
+                PRIMARY_INFO_FILE, self.config.name, e))

@@ -1,0 +1,9 @@
+Makefile
+inc/
+test/
+conf/
+*.bak
+*.old
+*.log
+*.gz
+*.rpm

@@ -1,0 +1,281 @@
+# (c) 2020 Frabit Project maintained and limited by Blylei < blylei.info@gmail.com >
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
+#
+# This file is part of Frabit
+#
+"""
+This module is the lock manager for Frabit
+"""
+
+import errno
+import fcntl
+import os
+import re
+
+from frabit.exceptions import (LockFileBusy, LockFileParsingError, LockFilePermissionDenied)
+
+
+class LockFile:
+    """
+    Ensures that there is only one process which is running against a specified LockFile.
+    It supports the Context Manager interface, allowing the use in with
+    statements.
+
+        with LockFile('file.lock') as locked:
+            if not locked:
+                print "failed"
+            else:
+                <do something>
+
+    You can also use exceptions on failures
+
+        try:
+            with LockFile('file.lock', True):
+                <do something>
+        except LockFileBusy, e, file:
+            print "failed to lock %s" % file
+
+    """
+
+    LOCK_PATTERN = None
+    r"""
+    If defined in a subclass, it must be a compiled regular expression
+    which matches the lock filename.
+
+    It must provide named groups for the constructor parameters which produce
+    the same lock name. I.e.:
+
+    >>> ServerWalReceiveLock('/tmp', 'server-name').filename
+    '/tmp/.server-name-receive-wal.lock'
+    >>> ServerWalReceiveLock.LOCK_PATTERN = re.compile(
+            r'\.(?P<server_name>.+)-receive-wal\.lock')
+    >>> m = ServerWalReceiveLock.LOCK_PATTERN.match(
+            '.server-name-receive-wal.lock')
+    >>> ServerWalReceiveLock('/tmp', **(m.groupdict())).filename
+    '/tmp/.server-name-receive-wal.lock'
+
+    """
+
+    @classmethod
+    def build_if_matches(cls, path):
+        """
+        Factory method that creates a lock instance if the path matches  the lock filename created by the actual class
+
+        :param path: the full path of a LockFile
+        :return:
+        """
+        # If LOCK_PATTERN is not defined always return None
+        if not cls.LOCK_PATTERN:
+            return None
+        # Matches the provided path against LOCK_PATTERN
+        lock_directory = os.path.abspath(os.path.dirname(path))
+        lock_name = os.path.basename(path)
+        match = cls.LOCK_PATTERN.match(lock_name)
+        if match:
+            # Build the lock object for the provided path
+            return cls(lock_directory, **(match.groupdict()))
+        return None
+
+    def __init__(self, filename, raise_if_fail=True, wait=False):
+        self.filename = os.path.abspath(filename)
+        self.fd = None
+        self.raise_if_fail = raise_if_fail
+        self.wait = wait
+
+    def acquire(self, raise_if_fail=None, wait=None, update_pid=True):
+        """
+        Creates and holds on to the lock file.
+
+        When raise_if_fail, a LockFileBusy is raised if the lock is held by someone else and a LockFilePermissionDenied
+        is raised when the user executing barman have insufficient rights for the creation of a LockFile.
+
+        Returns True if lock has been successfully acquired, False otherwise.
+
+        :param bool raise_if_fail: If True raise an exception on failure
+        :param bool wait: If True issue a blocking request
+        :param bool update_pid: Whether to write our pid in the lockfile
+        :returns bool: whether the lock has been acquired
+        """
+        if self.fd:
+            return True
+        fd = None
+        # method arguments take precedence on class parameters
+        raise_if_fail = raise_if_fail if raise_if_fail is not None else self.raise_if_fail
+        wait = wait if wait is not None else self.wait
+        try:
+            # 384 is 0600 in octal, 'rw-------'
+            fd = os.open(self.filename, os.O_CREAT | os.O_RDWR, 384)
+            flags = fcntl.LOCK_EX
+            if not wait:
+                flags |= fcntl.LOCK_NB
+            fcntl.flock(fd, flags)
+            if update_pid:
+                # Once locked, replace the content of the file
+                os.lseek(fd, 0, os.SEEK_SET)
+                pid = os.getpid()
+                os.write(fd, "{}\n".format(pid))
+                # Truncate the file at the current position
+                os.ftruncate(fd, os.lseek(fd, 0, os.SEEK_CUR))
+            self.fd = fd
+            return True
+        except (OSError, IOError) as e:
+            if fd:
+                os.close(fd)  # let's not leak  file descriptors
+            if raise_if_fail:
+                if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise LockFileBusy(self.filename)
+                elif e.errno == errno.EACCES:
+                    raise LockFilePermissionDenied(self.filename)
+                else:
+                    raise
+            else:
+                return False
+
+    def release(self):
+        """
+        Releases the lock.
+
+        If the lock is not held by the current process it does nothing.
+        """
+        if not self.fd:
+            return
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+        except (OSError, IOError):
+            pass
+        self.fd = None
+
+    def __del__(self):
+        """
+        Avoid stale lock files.
+        """
+        self.release()
+
+    # Contextmanager interface
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, exception_type, value, traceback):
+        self.release()
+
+    def get_owner_pid(self):
+        """
+        Test whether a lock is already held by a process.
+
+        Returns the PID of the owner process or None if the lock is available.
+
+        :rtype: int|None
+        :raises LockFileParsingError: when the lock content is garbled
+        :raises LockFilePermissionDenied: when the lockfile is not accessible
+        """
+        try:
+            self.acquire(raise_if_fail=True, wait=False, update_pid=False)
+        except LockFileBusy:
+            try:
+                # Read the lock content and parse the PID
+                # NOTE: We cannot read it in the self.acquire method to avoid reading the previous locker PID
+                with open(self.filename, 'r') as file_object:
+                    return int(file_object.readline().strip())
+            except ValueError as e:
+                # This should not happen
+                raise LockFileParsingError(e)
+        # release the lock and return None
+        self.release()
+        return None
+
+
+class GlobalCronLock(LockFile):
+    """
+    This lock protects cron from multiple executions.
+
+    Creates a global '.cron.lock' lock file under the given lock_directory.
+    """
+
+    def __init__(self, lock_directory):
+        super(GlobalCronLock, self).__init__(
+            os.path.join(lock_directory, '.cron.lock'), raise_if_fail=True)
+
+
+class ServerBackupLock(LockFile):
+    """
+    This lock protects a server from multiple executions of backup command
+
+    Creates a '.<SERVER>-backup.lock' lock file under the given lock_directory
+    for the named SERVER.
+    """
+
+    def __init__(self, lock_directory, server_name):
+        super(ServerBackupLock, self).__init__(
+            os.path.join(lock_directory, '.{}-backup.lock'.format(server_name)),
+            raise_if_fail=True)
+
+
+class ServerCronLock(LockFile):
+    """
+    This lock protects a server from multiple executions of cron command
+
+    Creates a '.<SERVER>-cron.lock' lock file under the given lock_directory
+    for the named SERVER.
+    """
+
+    def __init__(self, lock_directory, server_name):
+        super(ServerCronLock, self).__init__(
+            os.path.join(lock_directory, '.{}-cron.lock'.format(server_name)),
+            raise_if_fail=True, wait=False)
+
+
+class ServerWalArchiveLock(LockFile):
+    """
+    This lock protects a server from multiple executions of wal-archive command
+
+    Creates a '.<SERVER>-archive-wal.lock' lock file under
+    the given lock_directory for the named SERVER.
+    """
+
+    def __init__(self, lock_directory, server_name):
+        super(ServerWalArchiveLock, self).__init__(
+            os.path.join(lock_directory, '.%s-archive-wal.lock' % server_name),
+            raise_if_fail=True, wait=False)
+
+
+class ServerBackupIdLock(LockFile):
+    """
+    This lock protects from changing a backup that is in use.
+
+    Creates a '.<SERVER>-<BACKUP_ID>.lock' lock file under the given
+    lock_directory for a BACKUP of a SERVER.
+    """
+
+    def __init__(self, lock_directory, server_name, backup_id):
+        super(ServerBackupIdLock, self).__init__(
+            os.path.join(lock_directory, '.{server}-{backup}.lock'.format(
+                server=server_name, backup=backup_id)), raise_if_fail=True, wait=False)
+
+
+class ServerBackupSyncLock(LockFile):
+    """
+    This lock protects from multiple executions of the sync command on the same
+    backup.
+
+    Creates a '.<SERVER>-<BACKUP>-sync-backup.lock' lock file under the given lock_directory for a BACKUP of a SERVER.
+    """
+
+    def __init__(self, lock_directory, server_name, backup_id):
+        super(ServerBackupSyncLock, self).__init__(
+            os.path.join(lock_directory, '.{server}-{backup}-sync-backup.lock'.format(
+                server=server_name, backup=backup_id)), raise_if_fail=True, wait=False)
+
+
+class ServerBinlogSyncLock(LockFile):
+    """
+    This lock protects from multiple executions of the sync-binlog command
+
+    Creates a '.<SERVER>-sync-binlog.lock' lock file under the given lock_directory for the named SERVER.
+    """
+
+    def __init__(self, lock_directory, server_name):
+        super(ServerBinlogSyncLock, self).__init__(
+            os.path.join(lock_directory, '.{}-sync-binlog.lock'.format(server_name)),
+            raise_if_fail=True, wait=True)
