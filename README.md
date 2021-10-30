@@ -17,19 +17,14 @@
      2 . 远程备份文件恢复-online
 # 安装
 
- - pip安装
+ - build from source code
  ```shell
- pip install frabit
+ shell> git https://github.com/blylei/frabit.git
+ shell> cd frabit
+ shell> python setup.py install
 ```      
- - whl文件安装
-```shell
-# 从pypi官网下载安装文件到当前路径下
- wget https://files.pythonhosted.org/packages/2c/57/af502e0e113f139b3f3add4f1efba899a730a365d2264d476e85b9591da5/mydbs-1.0.0-.py3-none-any.whl
-# 使用pip进行安装
- pip install frabit-2.0.1-.py3-none-any.whl
-``` 
-Frabit 将备份策略，备份任务、备份实例以及巡检记录存储到MySQL数据库中。因此，在安装好Frabit之后，需要执行下列语句来初始化mydbs
 
+Frabit 将备份策略，备份任务、备份实例以及巡检记录存储到MySQL数据库中。因此，在安装好Frabit之后，需要执行下列语句来初始化mydbs
 ```bash
 mysql -u root -p < ${frabit_src_dir}/script/init_frabit.sql
 ```
