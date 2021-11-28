@@ -7,14 +7,11 @@
      
      2 . 物理备份:根据备份策略，调用[XtraBackup](https://www.percona.com/doc/percona-xtrabackup/LATEST/index.html)进行备份
      
-     3 . binlog备份:根据备份策略，调用[mysqlbinlog](https://dev.mysql.com/doc/refman/5.7/en/mysqlbinlog.html)进行备份
+     3 . binlog备份:根据备份策略，调用[mysqlbinlog](https://dev.mysql.com/doc/refman/5.7/en/mysqlbinlog.html)从对应的主库实时转储binlog
 
   
  -  备份恢复演练
-   
-     1 . 本地备份文件恢复-online
-     
-     2 . 远程备份文件恢复-online
+
 # 安装
 
  - build from source code
