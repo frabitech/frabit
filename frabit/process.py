@@ -12,7 +12,7 @@ from glob import glob
 
 from frabit import output
 from frabit.exceptions import LockFileParsingError
-from frabit.lock import ServerWalReceiveLock
+from frabit.lock import ServerBinlogSyncLock
 
 _logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ class ProcessManager:
 
     # Map containing the tasks we want to retrieve (and eventually manage)
     TASKS = {
-        'receive-wal': ServerWalReceiveLock
+        'receive-wal': ServerBinlogSyncLock
     }
 
     def __init__(self, config):
