@@ -226,16 +226,16 @@ class ServerCronLock(LockFile):
             raise_if_fail=True, wait=False)
 
 
-class ServerWalArchiveLock(LockFile):
+class ServerBinlogArchiveLock(LockFile):
     """
-    This lock protects a server from multiple executions of wal-archive command
+    This lock protects a server from multiple executions of binlog-archive command
 
-    Creates a '.<SERVER>-archive-wal.lock' lock file under
+    Creates a '.<SERVER>-archive-binlog.lock' lock file under
     the given lock_directory for the named SERVER.
     """
 
     def __init__(self, lock_directory, server_name):
-        super(ServerWalArchiveLock, self).__init__(
+        super(ServerBinlogArchiveLock, self).__init__(
             os.path.join(lock_directory, '.%s-archive-wal.lock' % server_name),
             raise_if_fail=True, wait=False)
 

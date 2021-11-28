@@ -38,7 +38,7 @@ from frabit.exceptions import (ArchiverFailure,
 from frabit.info import BackupInfo, LocalBackupInfo, BinlogInfo
 from frabit.lock import (ServerBackupIdLock, ServerBackupLock,
                          ServerBackupSyncLock, ServerCronLock,
-                         ServerWalArchiveLock, ServerBinlogSyncLock
+                         ServerBinlogArchiveLock, ServerBinlogSyncLock
                          )
 from frabit.mysql import MySQLConnection
 from frabit.process import ProcessManager
@@ -1851,7 +1851,7 @@ class Server(RemoteStatusMixin):
             # another 'archive-wal' command manually. However, it would result
             # in one of the two commands failing on lock acquisition,
             # with no other consequence.
-            with ServerWalArchiveLock(
+            with ServerBinlogArchiveLock(
                     self.config.frabit_lock_directory,
                     self.config.name):
                 # Output and release the lock immediately
@@ -1972,8 +1972,8 @@ class Server(RemoteStatusMixin):
         try:
             # Take care of the archive lock.
             # Only one archive job per server is admitted
-            with ServerWalArchiveLock(self.config.frabit_lock_directory,
-                                      self.config.name):
+            with ServerBinlogArchiveLock(self.config.frabit_lock_directory,
+                                         self.config.name):
                 self.backup_manager.archive_wal(verbose)
         except LockFileBusy:
             # If another process is running for this server,
