@@ -486,8 +486,7 @@ def redact_passwords(passwd):
     """
 
     # Remove passwords as found in key/value connection strings
-    passwd = re.sub(
-        "password=('(\\'|[^'])+'|[^ '\"]*)", "password=*REDACTED*", passwd)
+    passwd = re.sub("password=('(\\'|[^'])+'|[^ '\"]*)", "password=*REDACTED*", passwd)
 
     # Remove passwords in connection URLs
     passwd = re.sub(r'(?<=mysql:\/\/)([^ :@]+:)([^ :@]+)?@', r'\1*REDACTED*@', passwd)

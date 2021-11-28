@@ -3,9 +3,6 @@
 //
 // This file is part of Frabit
 //
-//
-// This module represents a backup.
-//
 
 syntax = "proto3";
 package Frabit;
