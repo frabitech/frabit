@@ -21,20 +21,6 @@ Frabit
   
  -  备份恢复演练
 
-# 安装
-
- - build from source code
- ```shell
- shell> git https://github.com/blylei/frabit.git
- shell> cd frabit
- shell> python setup.py install
-```      
-
-Frabit 将备份策略，备份任务、备份实例以及巡检记录存储到MySQL数据库中。因此，在安装好Frabit之后，需要执行下列语句来初始化mydbs
-```bash
-mysql -u root -p < ${frabit_src_dir}/script/init_frabit.sql
-```
- 
 # LICENSE 
 
 Copyright (C) 2020-2021 Blylei Limited
