@@ -2,6 +2,7 @@ Makefile
 inc/
 test/
 conf/
+.idea/
 *.bak
 *.old
 *.log
