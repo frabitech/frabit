@@ -1,6 +1,6 @@
 ![logo](images/Frabit.png)
 
-Frabit version v2.0.1-dev
+Frabit
 =========================
 ![PyPI - License](https://img.shields.io/github/license/blylei/frabit)
 [![downloads](https://img.shields.io/github/downloads/blylei/frabit/total.svg)](https://github.com/blylei/frabit/releases) 
