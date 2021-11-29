@@ -705,7 +705,7 @@ def shell_quote(arg):
     :return: The argument quoted
     """
 
-    # This is an excerpt of the Bash cn page, and the same applies for
+    # This is an excerpt of the Bash zh page, and the same applies for
     # every Posix compliant shell:
     #
     #     A  non-quoted backslash (\) is the escape character.  It preserves
