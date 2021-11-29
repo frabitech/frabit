@@ -1,3 +1,5 @@
+![logo](./Frabit.png)
+
 Frabit version v2.0.1-dev
 =========================
 ![PyPI - License](https://img.shields.io/pypi/l/Barman)

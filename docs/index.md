@@ -1,6 +1,6 @@
 # Frabit 
 
 ## 文档/Documentation
-[中文文档]()
+[中文文档](./docs/zh)
 
-[English Manual]()
+[English Manual](./docs/en)
