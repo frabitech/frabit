@@ -3,6 +3,7 @@ inc/
 test/
 conf/
 .idea/
+.github/
 *.bak
 *.old
 *.log
