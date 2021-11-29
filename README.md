@@ -7,8 +7,7 @@ Frabit
 [![downloads](https://img.shields.io/github/downloads/blylei/frabit/total.svg)](https://github.com/blylei/frabit/releases) 
 [![release](https://img.shields.io/github/v/release/blylei/frabit.svg)](https://github.com/blylei/frabit/releases)
 ![reales date](https://img.shields.io/github/release-date/blylei/frabit)
-![stars](https://img.shields.io/github/stars/blylei/frabit?style=social)
-![flowwers](https://img.shields.io/github/followers/blylei?style=social)
+
 
 # Frabit 集成了mysqldump、mysqlbinlog、xtrabackup等开源工具来完成MySQL的日常备份、恢复任务
 # 工具简介
