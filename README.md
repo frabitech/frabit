@@ -2,7 +2,7 @@
 
 Frabit version v2.0.1-dev
 =========================
-![PyPI - License](https://img.shields.io/pypi/l/Barman)
+![PyPI - License](https://img.shields.io/github/license/blylei/frabit)
 [![downloads](https://img.shields.io/github/downloads/blylei/frabit/total.svg)](https://github.com/blylei/frabit/releases) 
 [![release](https://img.shields.io/github/v/release/blylei/frabit.svg)](https://github.com/blylei/frabit/releases)
 
