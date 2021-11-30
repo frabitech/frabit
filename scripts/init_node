@@ -4,3 +4,17 @@
 #
 # This file is part of Frabit
 #
+set -x
+SERVER="$1"
+
+identify_os(){
+  local os_version=$(cat /etc/os-release | grep ^NAME | awk -F"=" '{print $2}')
+  echo "$os_version"
+}
+
+main(){
+  pass
+
+}
+
+main
