@@ -4,7 +4,8 @@ test/
 conf/
 .idea/
 .github/
-./dist
+dist/
+*info/
 *.bak
 *.old
 *.log

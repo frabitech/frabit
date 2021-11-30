@@ -635,6 +635,15 @@ class Mysqldump(Command):
         pass
 
 
+class MysqlPump(Mysqldump):
+    """A wrapper for Mysqldump"""
+    def __init__(self):
+        pass
+
+    def test(self):
+        pass
+
+
 class Mysqlbinlog(Command):
     """A wrapper for Mysqldump"""
 
