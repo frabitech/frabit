@@ -62,12 +62,12 @@ fi
 sed -i -e "3s/^%.*/% ${release_date} (${release_version})/" \
     doc/manual/00-head.en.md
 sed -i -e "s/__version__ = .*/__version__ = '${release_version}'/" \
-    barman/version.py
+    frabit/version.py
 
 make -C doc
 
 git add doc/manual/00-head.en.md \
-    barman/version.py
+    frabit/version.py
 git commit -sm "Version set to ${release_version}"
 
 echo "Version set to ${release_version}"
