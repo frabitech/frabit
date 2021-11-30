@@ -69,7 +69,6 @@ setup(
         'Topic :: System :: Archiving :: Backup',
         'Topic :: Database',
         'Topic :: System :: Recovery Tools',
-        'Intended Audience :: Database Administrators',
         'License :: OSI Approved :: GNU General Public License v3 or later '
         '(GPLv3+)',
         'Programming Language :: Python',

@@ -4,7 +4,7 @@ Frabit
 =========================
 ![PyPI - License](https://img.shields.io/github/license/blylei/frabit)
 ![size](https://img.shields.io/github/repo-size/blylei/frabit)
-![lanwage](https://img.shields.io/github/languages/top/blylei/frabit)
+![lang](https://img.shields.io/pypi/pyversions/frabit)
 [![status](https://img.shields.io/github/checks-status/blylei/frabit/master)](https://github.com/blylei/frabit/releases)
 [![downloads](https://img.shields.io/github/downloads/blylei/frabit/total.svg)](https://github.com/blylei/frabit/releases)
 [![release](https://img.shields.io/github/v/release/blylei/frabit.svg)](https://github.com/blylei/frabit/releases)
