@@ -9,7 +9,7 @@
 
 [04.逻辑备份](./04.逻辑备份.md)
 
-[05.Binlog备份](05.Binlog备份.md)
+[05.Binlog备份](./05.Binlog备份.md)
 
 [99.FAQ](./99.FAQ.md)
 
