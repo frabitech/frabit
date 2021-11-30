@@ -16,6 +16,8 @@ Frabit
 - pip 安装
 ```bash
 pip install frabit
+或者
+pip3 install frabit
 ```
 - 源码编译安装
 ```bash
