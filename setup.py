@@ -49,6 +49,7 @@ setup(
     version=frabit['__version__'],
     author='blylei Limited',
     author_email='blylei.info@gmail.com',
+    url='https://github.com/blylei/frabit',
     packages=find_packages(exclude=["tests"]),
     entry_points={
         'console_scripts': [
