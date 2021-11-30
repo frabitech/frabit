@@ -3,3 +3,4 @@
 #
 # This file is part of Frabit
 #
+import grpc
