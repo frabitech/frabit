@@ -53,6 +53,7 @@ setup(
     entry_points={
         'console_scripts': [
             'frabit=frabit.cli:main',
+            'frabit-rpc=frabit.cli_rpc:main',
         ],
     },
     license='GPL-3.0',
