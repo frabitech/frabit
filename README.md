@@ -26,7 +26,7 @@ Frabit
 ## 文档
 [简体中文](docs/zh/README.md)
 
-[English](docs/en/README.md)
+[English manual](docs/en/README.md)
 
 ## LICENSE 
 
