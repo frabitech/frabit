@@ -1,4 +1,4 @@
-![logo](images/Frabit.png)
+![logo](images/frabit.png)
 
 Frabit
 =========================
