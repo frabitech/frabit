@@ -58,7 +58,7 @@ shell> python3 setup.py install
     
      在备份实例上，执行以下命令，列出当前实例的备份集
      ```bash
-    shell> frabit list-backup 
+    shell> frabit list-backups 
     ```
     2 . 检查备份状态
 
