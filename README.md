@@ -47,7 +47,26 @@ shell> python3 setup.py install
     ```
   
  -  备份恢复演练
+    不管是物理备份，还是逻辑备份，只需要运行下面的命令，就能将数据恢复到专用于恢复的机器上
+    ```bash
+    shell> frabit restore backup_id -c config.cnf
+    ```
 
+ -  备份检查
+    
+    1 . 列出备份集
+    
+     在备份实例上，执行以下命令，列出当前实例的备份集
+     ```bash
+    shell> frabit list-backup 
+    ```
+    2 . 检查备份状态
+
+     在备份实例上，执行以下命令，检查指定备份是否成功
+     ```bash
+    shell> frabit check-backup backup_id 
+    ```
+   
 文档
 --------
 [简体中文](docs/zh/README.md)
