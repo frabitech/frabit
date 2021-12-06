@@ -1,4 +1,4 @@
-# (c) 2020 Frabit Project maintained and limited by Blylei < blylei.info@gmail.com >
+# (c) 2020 Frabit Project maintained and limited by FrabiTech < blylei.info@gmail.com >
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 #
 # This file is part of Frabit
@@ -47,9 +47,9 @@ with open('frabit/version.py', 'r') as version:
 setup(
     name='frabit',
     version=frabit['__version__'],
-    author='blylei Limited',
+    author='FrabiTech Limited',
     author_email='blylei.info@gmail.com',
-    url='https://github.com/blylei/frabit',
+    url='https://github.com/frabitech/frabit',
     packages=find_packages(exclude=["tests"]),
     entry_points={
         'console_scripts': [
