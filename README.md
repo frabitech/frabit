@@ -2,7 +2,7 @@
 
 Frabit
 =========================
-![PyPI - License](https://img.shields.io/github/license/blylei/frabit)
+![PyPI - License](https://img.shields.io/github/license/frabitech/frabit)
 ![size](https://img.shields.io/github/repo-size/blylei/frabit)
 ![lang](https://img.shields.io/pypi/pyversions/frabit)
 [![status](https://img.shields.io/github/checks-status/blylei/frabit/master)](https://github.com/blylei/frabit/releases)
@@ -47,7 +47,7 @@ shell> python3 setup.py install
     shell> frabit binlog -c config.cnf 
     ```
   
- -   备份恢复演练
+-   备份恢复演练
     
     1 不管是物理备份，还是逻辑备份，只需要运行下面的命令，就能将数据恢复到专用于恢复的机器上
     ```bash
@@ -58,7 +58,7 @@ shell> python3 setup.py install
     shell> frabit restore backup_id -c config.cnf
     ```
 
- -  备份检查
+-  备份检查
     
     1 . 列出备份集
     
