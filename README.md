@@ -22,7 +22,7 @@ pip3 install frabit
 ```
 - 源码编译安装
 ```bash
-shell> git clone https://github.com/blylei/frabit.git
+shell> git clone https://github.com/frabitech/frabit.git
 shell> cd frabit
 shell> python3 setup.py install
 
