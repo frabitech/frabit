@@ -7,4 +7,4 @@
 This module contains the current Frabit version.
 """
 
-__version__ = '2.0.4'
+__version__ = '2.0.5'
