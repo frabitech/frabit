@@ -22,6 +22,8 @@ name: Upload Python Package
 on:
   release:
     types: [published]
+    tags:
+      - 'v2.0.4'
   workflow_dispatch:
 jobs:
   deploy:
