@@ -8,7 +8,7 @@ Frabit
 [![status](https://img.shields.io/pypi/status/frabit)](https://github.com/frabitech/frabit/releases)
 [![downloads](https://img.shields.io/github/downloads/frabitech/frabit/total.svg)](https://github.com/frabitech/frabit/releases)
 [![pypi](https://img.shields.io/pypi/v/frabit)](https://github.com/frabitech/frabit/releases)
-[![Upload Python Package](https://github.com/frabitech/frabit/actions/workflows/python-publish.yml/badge.svg)](https://github.com/frabitech/frabit/actions/workflows/python-publish.yml)
+[![Upload PyPi](https://github.com/frabitech/frabit/actions/workflows/python-publish.yml/badge.svg)](https://github.com/frabitech/frabit/actions/workflows/python-publish.yml)
 
 # Frabit 一个专用于MySQL的备份管理工具
 
