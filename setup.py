@@ -67,7 +67,7 @@ setup(
     platforms=['Linux'],
     classifiers=[
         'Environment :: Console',
-        'Development Status :: 5 - Production/Stable',
+        'Development Status :: 4 - Beta',
         'Topic :: System :: Archiving :: Backup',
         'Topic :: Database',
         'Topic :: System :: Recovery Tools',
