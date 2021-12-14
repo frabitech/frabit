@@ -5,7 +5,6 @@ Frabit
 ![PyPI - License](https://img.shields.io/github/license/frabitech/frabit)
 ![lang](https://img.shields.io/pypi/pyversions/frabit)
 [![status](https://img.shields.io/pypi/status/frabit)](https://github.com/frabitech/frabit/releases)
-[![downloads](https://img.shields.io/github/downloads/frabitech/frabit/total.svg)](https://github.com/frabitech/frabit/releases)
 [![pypi](https://img.shields.io/pypi/v/frabit)](https://github.com/frabitech/frabit/releases)
 [![Upload PyPi](https://github.com/frabitech/frabit/actions/workflows/python-publish.yml/badge.svg)](https://github.com/frabitech/frabit/actions/workflows/python-publish.yml)
 [![CI](https://github.com/frabitech/frabit/actions/workflows/main.yml/badge.svg)](https://github.com/frabitech/frabit/actions/workflows/main.yml)
