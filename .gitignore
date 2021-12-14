@@ -3,7 +3,6 @@ inc/
 test/
 conf/
 .idea/
-.github/
 dist/
 *info/
 *.bak
