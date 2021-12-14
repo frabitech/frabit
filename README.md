@@ -3,7 +3,6 @@
 Frabit
 =========================
 ![PyPI - License](https://img.shields.io/github/license/frabitech/frabit)
-![size](https://img.shields.io/github/repo-size/frabitech/frabit)
 ![lang](https://img.shields.io/pypi/pyversions/frabit)
 [![status](https://img.shields.io/pypi/status/frabit)](https://github.com/frabitech/frabit/releases)
 [![downloads](https://img.shields.io/github/downloads/frabitech/frabit/total.svg)](https://github.com/frabitech/frabit/releases)
