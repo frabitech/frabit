@@ -1,5 +1,3 @@
-![logo](images/Frabit.png)
-
 Frabit
 =========================
 ![PyPI - License](https://img.shields.io/github/license/frabitech/frabit)
